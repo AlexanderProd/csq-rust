@@ -1,0 +1,5 @@
+numpy==1.26.4
+pylibjpeg==2.0.0
+pylibjpeg-libjpeg==2.1.0
+pylibjpeg-openjpeg==2.2.1
+pylibjpeg-rle==2.0.0
