@@ -12,6 +12,7 @@ use std::{
     path::PathBuf,
     sync::{mpsc, Arc, Mutex},
     thread,
+    time::Instant,
 };
 
 type Frame = Array2<f32>;
@@ -66,14 +67,19 @@ fn main() -> Result<()> {
 
     let mut reader = CSQReader::new(&args.input_file);
 
+    let metadata = reader.get_metadata()?;
+    let width = metadata.raw_thermal_image_width as i32;
+    let height = metadata.raw_thermal_image_height as i32;
+
     let (frames_tx, frames_rx) = mpsc::channel::<Frame>();
 
+    let now = Instant::now();
     let video_writer = Arc::new(Mutex::new(
         VideoWriter::new(
             "test.mp4",
             VideoWriter::fourcc('a', 'v', 'c', '1').expect("Failed to create fourcc"),
             30.0,
-            (1024, 768).into(),
+            (width, height).into(),
             true,
         )
         .expect("Failed to create video writer"),
@@ -119,6 +125,8 @@ fn main() -> Result<()> {
 
     let mut locked_writer = video_writer.lock().unwrap();
     locked_writer.release()?;
+
+    println!("Total time: {:?}", now.elapsed());
 
     Ok(())
 }

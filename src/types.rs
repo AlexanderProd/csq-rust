@@ -130,7 +130,7 @@ pub struct CSQExifData {
     #[serde(rename = "PlanckR2")]
     pub planck_r2: f32,
     #[serde(rename = "RawThermalImageWidth")]
-    pub raw_thermal_image_width: Option<String>,
+    pub raw_thermal_image_width: i16,
     #[serde(rename = "PaletteFileName")]
     pub palette_file_name: Option<String>,
     #[serde(rename = "PlanckR1")]
@@ -142,7 +142,7 @@ pub struct CSQExifData {
     #[serde(rename = "LensSerialNumber")]
     pub lens_serial_number: Option<String>,
     #[serde(rename = "RawThermalImageHeight")]
-    pub raw_thermal_image_height: Option<String>,
+    pub raw_thermal_image_height: i16,
     #[serde(rename = "PeakSpectralSensitivity")]
     pub peak_spectral_sensitivity: Option<String>,
     #[serde(rename = "ObjectDistance")]
@@ -193,6 +193,19 @@ impl<'de> Deserialize<'de> for CSQExifData {
                 })?
                 .parse::<f32>()
                 .map_err(|_| serde::de::Error::custom(format!("Failed to parse float for {}", key)))
+        };
+
+        let get_int = |key: &'static str| -> Result<i32, D::Error> {
+            map.get(key)
+                .ok_or_else(|| serde::de::Error::missing_field(key))?
+                .split_whitespace()
+                .collect::<Vec<&str>>()
+                .first()
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!("Failed to split whitespace for {}", key))
+                })?
+                .parse::<i32>()
+                .map_err(|_| serde::de::Error::custom(format!("Failed to parse int for {}", key)))
         };
 
         Ok(CSQExifData {
@@ -258,13 +271,13 @@ impl<'de> Deserialize<'de> for CSQExifData {
             date_time_original: get_optional_string("Date/TimeOriginal"),
             palette_stretch: get_optional_string("PaletteStretch"),
             planck_r2: get_float("PlanckR2")?,
-            raw_thermal_image_width: get_optional_string("RawThermalImageWidth"),
+            raw_thermal_image_width: get_int("RawThermalImageWidth")? as i16,
             palette_file_name: get_optional_string("PaletteFileName"),
             planck_r1: get_float("PlanckR1")?,
             file_modification_date_time: get_optional_string("FileModificationDate/Time"),
             lens_model: get_optional_string("LensModel"),
             lens_serial_number: get_optional_string("LensSerialNumber"),
-            raw_thermal_image_height: get_optional_string("RawThermalImageHeight"),
+            raw_thermal_image_height: get_int("RawThermalImageHeight")? as i16,
             peak_spectral_sensitivity: get_optional_string("PeakSpectralSensitivity"),
             object_distance: get_float("ObjectDistance")?,
             atmospheric_trans_beta1: get_float("AtmosphericTransBeta1")?,

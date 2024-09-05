@@ -1,54 +1,28 @@
-use std::env;
-
-use anyhow::{anyhow, Result};
-use ndarray::{Array2, ShapeBuilder};
-use pyo3::prelude::*;
+use anyhow::Result;
+use ndarray::Array2;
 
 use crate::types::CSQExifData;
 
-// The images in the CSQ file are old style JPEGs.
-// https://github.com/haraldk/TwelveMonkeys/issues/67
-pub fn decode_jpeg_py(img: &[u8]) -> Result<Array2<f32>> {
-    let decoded = Python::with_gil(|py| -> PyResult<Vec<Vec<f32>>> {
-        #[cfg(target_os = "macos")]
-        if let Ok(venv) = env::var("VIRTUAL_ENV") {
-            let sys = py.import_bound("sys")?;
-            let syspath = sys.getattr("path")?;
-            let version_info = py.version_info();
+const CELCIUS_OFFSET: f32 = 273.15;
 
-            syspath.call_method1(
-                "append",
-                (format!(
-                    "{}/lib/python{}.{}/site-packages",
-                    venv, version_info.major, version_info.minor
-                ),),
-            )?;
-        }
+pub fn vec_u8_to_f32(vec: &[u8]) -> Vec<f32> {
+    assert!(vec.len() % 2 == 0, "The length of the vector must be even");
 
-        let libjpeg = PyModule::import_bound(py, "pylibjpeg")
-            .expect("Failed to import libjpeg python module");
+    vec.chunks(2)
+        .map(|chunk| {
+            // Combine two bytes into a u16 integer
+            let u16 = (chunk[0] as u16) | ((chunk[1] as u16) << 8);
 
-        let res = libjpeg.getattr("decode")?.call1((img,))?;
-
-        let v = res.extract::<Vec<Vec<f32>>>()?;
-
-        Ok(v)
-    })?;
-
-    let cols = decoded.len();
-    let first_col_length = &decoded[0].len();
-    let rows = if cols > 0 { *first_col_length } else { 0 };
-
-    let flat: Vec<f32> = decoded.into_iter().flatten().collect();
-
-    let arr = Array2::from_shape_vec((rows, cols).f(), flat.to_vec())
-        .map_err(|e| anyhow!("Failed to create ndarray: {e}"))?
-        .reversed_axes();
-
-    Ok(arr)
+            // Convert to f32 since we're going to calculate with f32's later anyways
+            u16 as f32
+        })
+        .collect()
 }
 
-pub fn raw_to_temp(raw: &Array2<f32>, metadata: CSQExifData) -> Result<Box<Array2<f32>>> {
+pub fn raw_to_temp(
+    metadata: &CSQExifData,
+    radiance_values: &Array2<f32>,
+) -> Result<Box<Array2<f32>>> {
     let e = metadata.emissivity;
     let od = metadata.object_distance;
     let r_temp = metadata.reflected_apparent_temperature;
@@ -82,29 +56,29 @@ pub fn raw_to_temp(raw: &Array2<f32>, metadata: CSQExifData) -> Result<Box<Array
         + (1.0 - atx) * (-(od / 2.0).sqrt() * (ata2 + atb2 * h2o.sqrt())).exp();
     // Note: for this script, we assume the thermal window is at the mid-point (OD/2) between the source and the camera sensor
 
-    let raw_refl1 = pr1 / (pr2 * ((pb / (r_temp + 273.15)).exp() - pf)) - po;
+    let raw_refl1 = pr1 / (pr2 * ((pb / (r_temp + CELCIUS_OFFSET)).exp() - pf)) - po;
     let raw_refl1_attn = (1.0 - e) / e * raw_refl1;
 
-    let raw_atm1 = pr1 / (pr2 * ((pb / (a_temp + 273.15)).exp() - pf)) - po;
+    let raw_atm1 = pr1 / (pr2 * ((pb / (a_temp + CELCIUS_OFFSET)).exp() - pf)) - po;
     let raw_atm1_attn = (1.0 - tau1) / e / tau1 * raw_atm1;
 
-    let raw_wind = pr1 / (pr2 * ((pb / (ir_w_temp + 273.15)).exp() - pf)) - po;
+    let raw_wind = pr1 / (pr2 * ((pb / (ir_w_temp + CELCIUS_OFFSET)).exp() - pf)) - po;
     let raw_wind_attn = emiss_wind / e / tau1 / irt * raw_wind;
 
-    let raw_refl2 = pr1 / (pr2 * ((pb / (r_temp + 273.15)).exp() - pf)) - po;
+    let raw_refl2 = pr1 / (pr2 * ((pb / (r_temp + CELCIUS_OFFSET)).exp() - pf)) - po;
     let raw_refl2_attn = refl_wind / e / tau1 / irt * raw_refl2;
 
-    let raw_atm2 = pr1 / (pr2 * ((pb / (a_temp + 273.15)).exp() - pf)) - po;
+    let raw_atm2 = pr1 / (pr2 * ((pb / (a_temp + CELCIUS_OFFSET)).exp() - pf)) - po;
     let raw_atm2_attn = (1.0 - tau2) / e / tau1 / irt / tau2 * raw_atm2;
 
-    let raw_obj = raw / e / tau1 / irt / tau2
+    let raw_obj = radiance_values / e / tau1 / irt / tau2
         - raw_atm1_attn
         - raw_atm2_attn
         - raw_wind_attn
         - raw_refl1_attn
         - raw_refl2_attn;
 
-    let temp_c = pb / (pr1 / (pr2 * (&raw_obj + po)) + pf).mapv(|x| x.ln()) - 273.15;
+    let temp_c = pb / (pr1 / (pr2 * (&raw_obj + po)) + pf).mapv(|x| x.ln()) - CELCIUS_OFFSET;
 
     let temp_box = Box::new(temp_c);
 
