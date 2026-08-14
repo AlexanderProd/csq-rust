@@ -1,29 +1,52 @@
 [package]
 name = "csq"
-description = "csq is a library for extracting the thermal data from FLIR csq thermal video files."
-version = "0.1.0"
+description = "Decode FLIR CSQ/FFF thermal video: per-pixel temperatures, frame indexing, seeking and rendering — in pure Rust."
+version = "0.2.0"
 authors = ["Alexander Hörl <mail@alexanderhoerl.de>"]
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+rust-version = "1.74"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["flir", "thermal", "csq", "jpeg-ls", "radiometric"]
+categories = ["multimedia::images", "parser-implementations", "science"]
+exclude = ["tests/data/*", "examples/*"]
 
 [lib]
 name = "csq"
 path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-anyhow = "1.0.86"
-charls = { version = "0.3.1", features = ["static"] }
-lazy_static = "1.5.0"
-ndarray = { version = "0.15.6", features = ["rayon"] }
-pcre2 = "0.2.7"
-peck-exif = "1.0.1"
-rayon = "1.10.0"
-serde = { version = "1.0.203", features = ["derive"] }
-serde_json = "1.0.117"
-tempfile = "3.10.1"
+memmap2 = { version = "0.9", optional = true }
+ndarray = { version = "0.16", optional = true }
+png = { version = "0.17", optional = true }
+rayon = { version = "1.10", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+
+[dev-dependencies]
+clap = { version = "4.5", features = ["derive"] }
+png = "0.17"
+serde_json = "1.0"
+
+[features]
+default = ["mmap", "png"]
+# Memory-mapped random access to CSQ files.
+mmap = ["dep:memmap2"]
+# Support for FLIR files whose raw thermal image is stored as PNG.
+png = ["dep:png"]
+# Parallel frame decoding helpers.
+rayon = ["dep:rayon"]
+# `serde` implementations for metadata types.
+serde = ["dep:serde"]
+# Convert frames into `ndarray::Array2`.
+ndarray = ["dep:ndarray"]
 
 [workspace]
-members = ["examples/csq-to-video"]
-dependencies = { anyhow = { version = "1.0.86" }, ndarray = { version =  "0.15.6" }, serde_json = "1.0.117"}
+members = []
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[[example]]
+name = "csq-tool"
+required-features = ["png"]
