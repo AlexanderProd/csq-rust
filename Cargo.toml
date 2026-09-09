@@ -1,52 +1,18 @@
-[package]
-name = "csq"
-description = "Decode FLIR CSQ/FFF thermal video: per-pixel temperatures, frame indexing, seeking and rendering — in pure Rust."
-version = "0.2.0"
+[workspace]
+resolver = "2"
+members = ["crates/csq", "crates/csq-reader"]
+
+# Shared by both crates. Versions are deliberately not shared: the library and
+# the tool release on their own schedules, which is the point of the split.
+[workspace.package]
 authors = ["Alexander Hörl <mail@alexanderhoerl.de>"]
 edition = "2021"
-rust-version = "1.74"
 license = "MIT OR Apache-2.0"
-readme = "README.md"
-keywords = ["flir", "thermal", "csq", "jpeg-ls", "radiometric"]
-categories = ["multimedia::images", "parser-implementations", "science"]
-exclude = ["tests/data/*", "examples/*"]
 
-[lib]
-name = "csq"
-path = "src/lib.rs"
+[workspace.dependencies]
+csq = { version = "0.2.0", path = "crates/csq", default-features = false }
 
-[dependencies]
-memmap2 = { version = "0.9", optional = true }
-ndarray = { version = "0.16", optional = true }
-png = { version = "0.17", optional = true }
-rayon = { version = "1.10", optional = true }
-serde = { version = "1.0", features = ["derive"], optional = true }
-
-[dev-dependencies]
-clap = { version = "4.5", features = ["derive"] }
-png = "0.17"
-serde_json = "1.0"
-
-[features]
-default = ["mmap", "png"]
-# Memory-mapped random access to CSQ files.
-mmap = ["dep:memmap2"]
-# Support for FLIR files whose raw thermal image is stored as PNG.
-png = ["dep:png"]
-# Parallel frame decoding helpers.
-rayon = ["dep:rayon"]
-# `serde` implementations for metadata types.
-serde = ["dep:serde"]
-# Convert frames into `ndarray::Array2`.
-ndarray = ["dep:ndarray"]
-
-[workspace]
-members = []
-
+# Profiles are workspace-wide; a member's own `[profile]` section is ignored.
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-[[example]]
-name = "csq-tool"
-required-features = ["png"]

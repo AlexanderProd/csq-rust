@@ -1,0 +1,19 @@
+[package]
+name = "csq-reader"
+description = "Command line reader for FLIR CSQ thermal recordings: per-pixel temperatures, per-frame statistics and metadata, on stdout."
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.85"
+readme = "README.md"
+keywords = ["flir", "thermal", "csq", "cli", "radiometric"]
+categories = ["command-line-utilities", "science"]
+
+[[bin]]
+name = "csq-reader"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+csq = { workspace = true, features = ["mmap", "png"] }
