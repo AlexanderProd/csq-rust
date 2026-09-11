@@ -1,6 +1,6 @@
-//! Read FLIR CSQ thermal recordings: per-pixel temperatures, frame indexing,
-//! seeking and rendering — in pure Rust, with no `exiftool` process and no C++
-//! toolchain.
+//! Read and write FLIR CSQ thermal recordings: per-pixel temperatures, frame
+//! indexing, seeking and rendering — in pure Rust, with no `exiftool` process
+//! and no C++ toolchain.
 //!
 //! # What a CSQ file is
 //!
@@ -80,6 +80,33 @@
 //! Reusing one [`TemperatureTable`] matters: it turns the per-pixel
 //! exponential and logarithm into a table lookup.
 //!
+//! # Writing
+//!
+//! [`write::CsqWriter`] runs the whole thing backwards: frames of temperatures
+//! in, a recording FLIR's own tools will open out. Encoding is spread over a
+//! thread pool by default, so a live 60 fps feed at a large sensor size does
+//! not have to wait for it.
+//!
+//! ```no_run
+//! # fn main() -> csq::Result<()> {
+//! # let radiometric = csq::CsqFile::open("reference.csq")?.metadata().unwrap().radiometric;
+//! # let feed: Vec<Vec<f32>> = Vec::new();
+//! let mut metadata = csq::FrameMetadata::new(640, 480, radiometric);
+//! metadata.frame_rate = Some(60.0);
+//!
+//! let mut writer = csq::write::create("out.csq", metadata)?;
+//! for celsius in &feed {
+//!     writer.write_celsius(celsius)?;
+//! }
+//! writer.finish()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The [`RadiometricParameters`] are what make the file mean something: they
+//! are how a reader turns the stored counts back into °C, so writing needs a
+//! calibration the same way reading does. See [`write`] for the details.
+//!
 //! # Rendering
 //!
 //! [`render::Renderer`] maps temperatures onto a colour ramp and writes plain
@@ -112,6 +139,7 @@ pub mod fff;
 pub mod jpegls;
 pub mod metadata;
 pub mod render;
+pub mod write;
 
 mod decode;
 mod error;
@@ -129,12 +157,42 @@ pub use index::{FrameIndex, FrameLocation};
 pub use metadata::FrameMetadata;
 pub use stream::{CsqStream, StreamFrames};
 pub use thermal::{
-    AtmosphericTransmission, PlanckConstants, RadiometricParameters, TemperatureTable,
+    AtmosphericTransmission, PlanckConstants, RadiometricParameters, RawConversion,
+    TemperatureTable,
 };
+pub use write::CsqWriter;
 
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::frame::TemperatureImage;
+    use crate::thermal::{AtmosphericTransmission, PlanckConstants, RadiometricParameters};
+
+    /// Calibration of the FLIR T1020 the test fixtures came from.
+    pub fn parameters() -> RadiometricParameters {
+        RadiometricParameters {
+            emissivity: 0.76,
+            object_distance: 50.0,
+            reflected_apparent_temperature: 31.0,
+            atmospheric_temperature: 36.0,
+            ir_window_temperature: 31.0,
+            ir_window_transmission: 1.0,
+            relative_humidity: 25.0,
+            planck: PlanckConstants {
+                r1: 11895.471,
+                b: 1328.9,
+                f: 1.0,
+                o: -3869.0,
+                r2: 0.013_583_817,
+            },
+            atmospheric: AtmosphericTransmission {
+                alpha1: 0.006569,
+                alpha2: 0.012620,
+                beta1: -0.002276,
+                beta2: -0.006670,
+                x: 1.9,
+            },
+        }
+    }
 
     /// Builds a `TemperatureImage` directly, for tests that do not need a file.
     pub fn temperature_image(width: usize, height: usize, celsius: &[f32]) -> TemperatureImage {

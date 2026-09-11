@@ -1,15 +1,15 @@
 # csq
 
-Read FLIR CSQ thermal recordings in Rust: per-pixel temperatures, frame
-indexing, seeking and rendering.
+Read and write FLIR CSQ thermal recordings in Rust: per-pixel temperatures,
+frame indexing, seeking, rendering, and recording.
 
 No `exiftool` subprocess, no C++ toolchain, no system libraries — the FFF
-(FLIR File Format) container parser, the JPEG-LS decoder and the radiometric
+(FLIR File Format) container parser, the JPEG-LS codec and the radiometric
 model are all in this crate. The only mandatory dependency is `memmap2`.
 
 ```toml
 [dependencies]
-csq = "0.2"
+csq = "0.3"
 ```
 
 ## What it does
@@ -88,6 +88,82 @@ if let Some(gps) = &metadata.gps {
 }
 ```
 
+## Writing
+
+`CsqWriter` runs the whole thing backwards. Frames of temperatures go in and a
+recording FLIR's own tools open comes out — `exiftool` reads every field back,
+and the embedded JPEG-LS streams decode in `ffmpeg` and anything else built on
+CharLS.
+
+```rust
+let mut metadata = csq::FrameMetadata::new(640, 480, radiometric);
+metadata.camera.model = "Bench rig".into();
+metadata.frame_rate = Some(60.0);
+
+let mut writer = csq::write::create("out.csq", metadata)?;
+for celsius in &feed {
+    writer.write_celsius(celsius)?;
+}
+writer.finish()?;
+```
+
+Temperatures are not what the format stores. A camera records raw detector
+counts, and a reader turns those into °C with the Planck constants and scene
+parameters carried in each frame, so writing has to run that conversion
+backwards — which means the `RadiometricParameters` are load-bearing, not
+decoration. The most reliable source is a recording from the camera the data
+came from; failing that, any self-consistent set round-trips exactly, it just
+will not agree with some other camera's measurements.
+
+Everything else is carried through when given and left empty when not: camera
+and lens identification, capture time, GPS fix, display palette. Per-frame
+detail rides along with the frame:
+
+```rust
+use csq::metadata::Timestamp;
+use csq::write::WriteFrame;
+
+writer.write(
+    WriteFrame::celsius(&celsius)
+        .at(Timestamp::now(120))
+        .with_gps(fix.clone()),
+)?;
+```
+
+Counts can also be handed over directly with `WriteFrame::raw`, which is what
+copying frames out of another recording wants — nothing is converted, so
+lossless coding reproduces the original measurements exactly.
+
+Frames are coded losslessly by default. `WriteOptions::near_lossless(n)` bounds
+each count's error by `n` instead, which is what cameras do, and roughly halves
+the file again:
+
+| 640×480 frame from a T560 | Size    |
+| ------------------------- | ------- |
+| uncompressed 16-bit       | 614 kB  |
+| lossless                  | 179 kB  |
+| near-lossless, `near = 4` | 67 kB   |
+
+### Keeping up with a live feed
+
+Writing is streaming: no index to fix up at the end, nothing buffered beyond
+the frames in hand. The cost is JPEG-LS encoding, which by default runs on a
+small pool of worker threads while frames still reach the sink in recording
+order. Measured on a ten-core M-series Mac:
+
+| Frame size | One thread | Pooled (default) |
+| ---------- | ---------- | ---------------- |
+| 640×480    | 128 fps    | 933 fps          |
+| 1024×768   | 51 fps     | 365 fps          |
+
+So the pool is the difference between keeping up with a 60 fps feed at a large
+sensor and not. `write` hands a frame over and returns, blocking only once the
+encoders are a couple of frames behind, so a producer running at frame rate
+stays at frame rate; errors from a frame still being encoded surface on a later
+`write` or on `finish`. `WriteOptions::single_threaded()` encodes inline
+instead. Both produce the same bytes, and neither allocates per frame once
+warm.
+
 ### Rendering
 
 `render::Renderer` maps temperatures onto a colour ramp and writes plain RGB8,
@@ -126,6 +202,14 @@ thumbnails, `ffmpeg` video:
 cargo run --release --example csq-tool -- export recording.csq -o out/
 ```
 
+`examples/csq-write.rs` covers writing, both from an existing recording and
+from nothing at all:
+
+```
+cargo run --release --example csq-write -- recode in.csq out.csq --near 4
+cargo run --release --example csq-write -- synth out.csq --frames 120
+```
+
 ## Performance
 
 Measured on an M-series Mac, 1024×768 frames from a FLIR T1020:
@@ -135,6 +219,8 @@ Measured on an M-series Mac, 1024×768 frames from a FLIR T1020:
 | Index a 361 MB / 2108-frame recording | 2.7 ms warm, ~350 ms cold |
 | Decode + convert to °C                | ~60 fps (2× realtime)     |
 | Seek + decode + render + write a PNG  | ~26 ms                    |
+| Encode + write, one thread            | 51 fps                    |
+| Encode + write, pooled                | 365 fps                   |
 
 Indexing reads 64 bytes per frame — every FFF header states its own length — so
 it costs one page fault per frame rather than a scan. Cold timings are
@@ -166,8 +252,13 @@ single file — a T1020 recording was seen switching between 5 and 16 to hit a
 bitrate target, while a T560 held 4 throughout — so it is read per stream.
 Uncompressed 16-bit and PNG-encoded thermal images are handled too.
 
+The 64-byte frame header ends with a checksum, which is a CRC-32 (the zlib and
+PNG polynomial) over the header and the record directory entries in use, with
+the checksum field itself read as zero. Recordings from four camera generations
+agree on this, and files written here carry it.
+
 `csq::fff` and `csq::jpegls` are public, so the container walker and the JPEG-LS
-decoder can be used on their own.
+codec can be used on their own.
 
 ### Format variations handled
 

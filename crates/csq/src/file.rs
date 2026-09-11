@@ -103,11 +103,21 @@ impl CsqFile {
             .transpose()?
             .map(|frame| frame.metadata().clone());
 
-        Ok(Self {
+        let mut file = Self {
             storage,
             index,
             first_metadata,
-        })
+        };
+        // Skipping the image leaves the geometry unset, because a `Frame`
+        // without pixels must not claim to have any. The metadata a caller
+        // reads off the file describes the recording rather than a decoded
+        // frame, so it carries the real dimensions.
+        if let Some(metadata) = file.first_metadata.as_mut() {
+            let (width, height) = raw_geometry(&file.storage, file.index.get(0));
+            metadata.width = width;
+            metadata.height = height;
+        }
+        Ok(file)
     }
 
     /// Number of frames in the recording.
@@ -158,33 +168,8 @@ impl CsqFile {
     pub fn dimensions(&self) -> Option<(usize, usize)> {
         self.first_metadata
             .as_ref()
-            .map(|_| self.frame_dimensions())
+            .map(|metadata| (metadata.width, metadata.height))
             .filter(|(w, h)| *w > 0 && *h > 0)
-    }
-
-    fn frame_dimensions(&self) -> (usize, usize) {
-        // `metadata_only` decoding zeroes the geometry, so read it back from
-        // the raw-data record header of the first frame.
-        self.frame_bytes(0)
-            .ok()
-            .and_then(|bytes| {
-                crate::fff::FrameLayout::parse(bytes, 0)
-                    .ok()
-                    .map(|l| (bytes, l))
-            })
-            .and_then(|(bytes, layout)| {
-                layout
-                    .record_data(bytes, crate::fff::RecordType::RawData)
-                    .ok()
-                    .filter(|record| record.len() >= 6)
-                    .map(|record| {
-                        (
-                            usize::from(u16::from_le_bytes([record[2], record[3]])),
-                            usize::from(u16::from_le_bytes([record[4], record[5]])),
-                        )
-                    })
-            })
-            .unwrap_or((0, 0))
     }
 
     /// Recording frame rate in frames per second.
@@ -242,14 +227,18 @@ impl CsqFile {
 
     /// Decodes a frame's metadata without decoding its image.
     pub fn frame_metadata(&self, index: usize) -> Result<FrameMetadata> {
-        Ok(FrameDecoder::new()
+        let mut metadata = FrameDecoder::new()
             .decode(
                 self.frame_bytes(index)?,
                 self.location(index)?.offset,
                 DecodeOptions::metadata_only(),
             )?
             .metadata()
-            .clone())
+            .clone();
+        let (width, height) = raw_geometry(&self.storage, self.index.get(index));
+        metadata.width = width;
+        metadata.height = height;
+        Ok(metadata)
     }
 
     /// Decodes every frame in parallel, in order.
@@ -271,6 +260,28 @@ impl CsqFile {
             })
             .collect()
     }
+}
+
+/// Reads the image geometry out of a frame's raw-data record header.
+///
+/// The record header is the authoritative source: the camera-info record
+/// repeats it, but a frame is what it says its image is.
+fn raw_geometry(storage: &[u8], location: Option<FrameLocation>) -> (usize, usize) {
+    location
+        .and_then(|location| storage.get(location.range()))
+        .and_then(|bytes| {
+            let layout = crate::fff::FrameLayout::parse(bytes, 0).ok()?;
+            let record = layout
+                .record_data(bytes, crate::fff::RecordType::RawData)
+                .ok()?;
+            (record.len() >= 6).then(|| {
+                (
+                    usize::from(u16::from_le_bytes([record[2], record[3]])),
+                    usize::from(u16::from_le_bytes([record[4], record[5]])),
+                )
+            })
+        })
+        .unwrap_or((0, 0))
 }
 
 impl std::fmt::Debug for CsqFile {

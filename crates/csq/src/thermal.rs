@@ -144,6 +144,37 @@ impl RadiometricParameters {
         self.constants().celsius(raw)
     }
 
+    /// The coldest and warmest temperature these parameters can express, in °C.
+    ///
+    /// Counts below the curve's domain decode to `NaN`, and the top of the
+    /// 16-bit range is as hot as the calibration goes, so this is the span in
+    /// which a measurement means anything.
+    pub fn resolvable_span(&self) -> (f32, f32) {
+        let constants = self.constants();
+        let coldest = (0..=u16::MAX)
+            .map(|raw| constants.celsius(raw))
+            .find(|celsius| celsius.is_finite())
+            .unwrap_or(0.0);
+        let warmest = (0..=u16::MAX)
+            .rev()
+            .map(|raw| constants.celsius(raw))
+            .find(|celsius| celsius.is_finite())
+            .unwrap_or(0.0);
+        (coldest.min(warmest), warmest.max(coldest))
+    }
+
+    /// Prepares the model for running backwards, temperatures to raw counts.
+    ///
+    /// This is what a [`CsqWriter`](crate::write::CsqWriter) needs: the camera
+    /// stores counts, so a caller who has temperatures has to undo the
+    /// conversion before the frame can be written.
+    pub fn raw_conversion(&self) -> RawConversion {
+        RawConversion {
+            parameters: *self,
+            constants: self.constants(),
+        }
+    }
+
     /// Builds the full 16-bit lookup table for these parameters.
     pub fn temperature_table(&self) -> TemperatureTable {
         let constants = self.constants();
@@ -159,6 +190,7 @@ impl RadiometricParameters {
 }
 
 /// Scene-independent terms of the radiometric model.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct ConversionConstants {
     scale: f32,
     attenuation: f32,
@@ -170,6 +202,84 @@ impl ConversionConstants {
     fn celsius(&self, raw: u16) -> f32 {
         let object_radiance = f32::from(raw) * self.scale - self.attenuation;
         self.planck.celsius_at(object_radiance)
+    }
+
+    #[inline]
+    fn raw(&self, celsius: f32) -> f32 {
+        (self.planck.radiance_at(celsius) + self.attenuation) / self.scale
+    }
+}
+
+/// The radiometric model run backwards: °C to raw detector counts.
+///
+/// The inverse of [`TemperatureTable`], and the piece a writer needs. Unlike
+/// the forward direction this is not a lookup table: raw counts are 16-bit and
+/// so tabulate exactly, but temperatures are continuous, and a table fine
+/// enough to keep the round trip within one count would be larger than the
+/// arithmetic is slow. What is precomputed is everything that does not depend
+/// on the pixel, which leaves one exponential and a handful of flops per
+/// sample — enough for a 640×480 feed to convert in a few milliseconds a frame.
+///
+/// ```no_run
+/// # fn main() -> csq::Result<()> {
+/// let file = csq::CsqFile::open("recording.csq")?;
+/// let parameters = file.metadata().unwrap().radiometric;
+///
+/// let table = parameters.temperature_table();
+/// let inverse = parameters.raw_conversion();
+///
+/// // Counts survive the round trip.
+/// assert_eq!(inverse.raw(table.celsius(13_200)), 13_200);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RawConversion {
+    parameters: RadiometricParameters,
+    constants: ConversionConstants,
+}
+
+impl RawConversion {
+    /// Prepares the conversion for the given parameters.
+    pub fn new(parameters: &RadiometricParameters) -> Self {
+        parameters.raw_conversion()
+    }
+
+    /// The parameters this conversion was built from.
+    pub fn parameters(&self) -> &RadiometricParameters {
+        &self.parameters
+    }
+
+    /// The raw count a pixel at `celsius` would have produced.
+    ///
+    /// The result is monotonic over the whole input range: temperatures the
+    /// detector cannot represent saturate at either end rather than wrapping,
+    /// which matters because a wrapped count would read back as a plausible
+    /// measurement. `NaN` — the value the forward direction uses for a pixel
+    /// off the calibration curve — maps to `0`.
+    #[inline]
+    pub fn raw(&self, celsius: f32) -> u16 {
+        if celsius.is_nan() {
+            return 0;
+        }
+        // Below absolute zero the Planck curve has no meaning and its
+        // arithmetic changes sign, so the coldest physical temperature is the
+        // floor rather than something that reads as hot.
+        let celsius = celsius.max(-crate::metadata::KELVIN_OFFSET);
+        let raw = self.constants.raw(celsius);
+        // Clamping before the cast keeps a value past `u16::MAX` — or an
+        // infinity — from saturating in whichever direction the cast picks.
+        raw.round().clamp(0.0, f32::from(u16::MAX)) as u16
+    }
+
+    /// Converts a whole buffer of temperatures into `out`.
+    ///
+    /// `out` keeps its allocation, so a writer walking a feed converts every
+    /// frame into the same buffer.
+    pub fn convert_into(&self, celsius: &[f32], out: &mut Vec<u16>) {
+        out.clear();
+        out.reserve(celsius.len());
+        out.extend(celsius.iter().map(|&value| self.raw(value)));
     }
 }
 
@@ -219,34 +329,7 @@ impl TemperatureTable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// Calibration of the FLIR T1020 the test fixtures came from.
-    fn parameters() -> RadiometricParameters {
-        RadiometricParameters {
-            emissivity: 0.76,
-            object_distance: 50.0,
-            reflected_apparent_temperature: 31.0,
-            atmospheric_temperature: 36.0,
-            ir_window_temperature: 31.0,
-            ir_window_transmission: 1.0,
-            relative_humidity: 25.0,
-            planck: PlanckConstants {
-                r1: 11895.471,
-                b: 1328.9,
-                f: 1.0,
-                o: -3869.0,
-                r2: 0.013_583_817,
-            },
-            atmospheric: AtmosphericTransmission {
-                alpha1: 0.006569,
-                alpha2: 0.012620,
-                beta1: -0.002276,
-                beta2: -0.006670,
-                x: 1.9,
-            },
-        }
-    }
+    use crate::test_support::parameters;
 
     #[test]
     fn planck_curve_round_trips() {
@@ -272,6 +355,77 @@ mod tests {
                 (direct - looked_up).abs() < 1e-4 || (direct.is_nan() && looked_up.is_nan()),
                 "raw {raw}: direct {direct} vs table {looked_up}"
             );
+        }
+    }
+
+    #[test]
+    fn raw_conversion_inverts_the_table() {
+        let params = parameters();
+        let table = params.temperature_table();
+        let inverse = params.raw_conversion();
+
+        // Counts below the curve's domain decode to NaN and have no
+        // temperature to come back from, so the round trip is only meaningful
+        // over the span the detector actually resolves.
+        let first = (0..=u16::MAX)
+            .find(|&raw| table.celsius(raw).is_finite())
+            .expect("the curve resolves something");
+
+        for raw in first..=u16::MAX {
+            let celsius = table.celsius(raw);
+            assert_eq!(inverse.raw(celsius), raw, "raw {raw} -> {celsius} °C");
+        }
+    }
+
+    #[test]
+    fn raw_conversion_saturates_instead_of_wrapping() {
+        let inverse = parameters().raw_conversion();
+        let table = parameters().temperature_table();
+
+        // Below the coldest temperature the curve expresses, the count has to
+        // stop rather than wrap around to a scalding one.
+        let floor = inverse.raw(table.celsius(inverse.raw(-200.0)));
+        for celsius in [-273.15f32, -1000.0, -1.0e9, f32::NEG_INFINITY] {
+            let raw = inverse.raw(celsius);
+            assert!(
+                raw <= floor,
+                "{celsius} °C produced raw {raw}, floor is {floor}"
+            );
+        }
+
+        assert_eq!(inverse.raw(1.0e9), u16::MAX);
+        assert_eq!(inverse.raw(f32::INFINITY), u16::MAX);
+        assert_eq!(inverse.raw(f32::NAN), 0, "no data in, no signal out");
+    }
+
+    #[test]
+    fn raw_conversion_follows_the_scene_parameters() {
+        // The inverse has to undo the same corrections the forward direction
+        // applies, so changing a parameter must move both together.
+        let mut params = parameters();
+        params.emissivity = 0.95;
+        params.object_distance = 3.0;
+
+        let table = params.temperature_table();
+        let inverse = params.raw_conversion();
+        for raw in [8_000u16, 13_200, 40_000] {
+            assert_eq!(inverse.raw(table.celsius(raw)), raw);
+        }
+
+        // And the count for a fixed temperature must differ from the one the
+        // original parameters give, or nothing is being corrected at all.
+        assert_ne!(inverse.raw(30.0), parameters().raw_conversion().raw(30.0));
+    }
+
+    #[test]
+    fn buffer_conversion_matches_the_scalar_one() {
+        let inverse = parameters().raw_conversion();
+        let celsius = [-40.0f32, 0.0, 23.5, 100.0, f32::NAN];
+        let mut out = vec![7u16; 3];
+        inverse.convert_into(&celsius, &mut out);
+        assert_eq!(out.len(), celsius.len());
+        for (&c, &raw) in celsius.iter().zip(&out) {
+            assert_eq!(raw, inverse.raw(c));
         }
     }
 

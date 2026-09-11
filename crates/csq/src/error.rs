@@ -69,6 +69,20 @@ pub enum Error {
         len: usize,
     },
 
+    /// A frame handed to a writer does not hold the expected number of pixels.
+    FrameSizeMismatch {
+        /// Pixels the recording's geometry calls for.
+        expected: usize,
+        /// Pixels the frame actually held.
+        actual: usize,
+    },
+
+    /// A recording cannot be written as described.
+    Unwritable {
+        /// Human-readable description of what is in the way.
+        detail: &'static str,
+    },
+
     /// Pixel coordinates fell outside the image.
     PixelOutOfRange {
         /// Requested coordinates.
@@ -110,6 +124,11 @@ impl fmt::Display for Error {
                     "frame index {index} is out of range (file has {len} frames)"
                 )
             }
+            Self::FrameSizeMismatch { expected, actual } => write!(
+                f,
+                "frame holds {actual} pixels but the recording is {expected} pixels a frame"
+            ),
+            Self::Unwritable { detail } => write!(f, "cannot write this recording: {detail}"),
             Self::PixelOutOfRange { position, size } => write!(
                 f,
                 "pixel ({}, {}) is outside the {}x{} image",

@@ -9,11 +9,19 @@
 //! Only what CSQ actually needs is implemented: a single scan over a single
 //! component with interleave mode 0. Anything else is rejected with
 //! [`JpegLsError::Unsupported`] rather than silently mis-decoded.
+//!
+//! [`JpegLsEncoder`] is the same procedure run backwards, and writes the stream
+//! FLIR's own encoder writes. Encoder and decoder share their coding model, so
+//! neither can drift away from the other.
 
 mod bitreader;
+mod bitwriter;
+mod coding;
 mod decoder;
+mod encoder;
 
 pub use decoder::{JpegLsDecoder, JpegLsInfo};
+pub use encoder::{EncodeOptions, JpegLsEncoder};
 
 use std::fmt;
 
@@ -56,6 +64,15 @@ impl fmt::Display for JpegLsError {
 }
 
 impl std::error::Error for JpegLsError {}
+
+/// Encodes samples into a complete JPEG-LS stream.
+///
+/// For repeated encoding (for example while writing a CSQ file) prefer
+/// [`JpegLsEncoder`], which reuses its scratch buffers.
+pub fn encode(samples: &[u16], options: EncodeOptions) -> Result<Vec<u8>, JpegLsError> {
+    let mut encoder = JpegLsEncoder::new();
+    Ok(encoder.encode(samples, options)?.to_vec())
+}
 
 /// Decodes a complete JPEG-LS stream into a freshly allocated sample buffer.
 ///
