@@ -10,7 +10,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-csq = { version = "0.2.0", path = "crates/csq", default-features = false }
+csq = { version = "0.3.0", path = "crates/csq", default-features = false }
 
 # Profiles are workspace-wide; a member's own `[profile]` section is ignored.
 [profile.release]

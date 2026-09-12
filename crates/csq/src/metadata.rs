@@ -72,6 +72,37 @@ impl Timestamp {
         })
     }
 
+    /// The current instant, with the given offset from UTC in minutes.
+    ///
+    /// The offset only affects how the time reads back locally; the instant
+    /// itself is stored in UTC either way. Pass `0` when the recording has no
+    /// meaningful local time zone.
+    pub fn now(utc_offset_minutes: i16) -> Self {
+        Self::from_system_time(SystemTime::now(), utc_offset_minutes)
+    }
+
+    /// Converts a [`SystemTime`], with the given offset from UTC in minutes.
+    pub fn from_system_time(time: SystemTime, utc_offset_minutes: i16) -> Self {
+        let (seconds, milliseconds) = match time.duration_since(UNIX_EPOCH) {
+            Ok(since) => (since.as_secs() as i64, since.subsec_millis() as u16),
+            Err(before) => {
+                let before = before.duration();
+                // Milliseconds count forward from the second below, so a time
+                // before the epoch rounds down rather than towards zero.
+                let seconds = -(before.as_secs() as i64);
+                match before.subsec_millis() {
+                    0 => (seconds, 0),
+                    millis => (seconds - 1, (1000 - millis) as u16),
+                }
+            }
+        };
+        Self {
+            unix_seconds: seconds,
+            milliseconds,
+            utc_offset_minutes,
+        }
+    }
+
     /// The instant as a [`SystemTime`].
     pub fn as_system_time(&self) -> SystemTime {
         let base = if self.unix_seconds >= 0 {
@@ -183,17 +214,27 @@ pub struct TemperatureRange {
     pub max_saturated: f32,
 }
 
-/// The span of raw detector counts present in a frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The raw-count fields a camera records alongside a frame.
+///
+/// None of these are statistics of the image, which is worth knowing before
+/// reaching for them. `min` and `max` are the counts the calibration
+/// saturates at — the Planck curve evaluated at
+/// [`TemperatureRange::min_saturated`] and [`TemperatureRange::max_saturated`],
+/// so they are constant across a recording. `median` and `range` are the level
+/// and span the camera had picked for its own display.
+///
+/// For the counts a particular frame actually holds, look at
+/// [`Frame::raw`](crate::Frame::raw).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RawValueRange {
-    /// Smallest raw value the camera saw.
+    /// Count at which the calibration saturates at the cold end.
     pub min: u16,
-    /// Largest raw value the camera saw.
+    /// Count at which the calibration saturates at the hot end.
     pub max: u16,
-    /// Median raw value.
+    /// Display level: the count the palette is centred on.
     pub median: u16,
-    /// Spread the camera used for its own auto-scaling.
+    /// Display span: how many counts the palette covers.
     pub range: u16,
 }
 
@@ -305,6 +346,10 @@ pub struct Palette {
     pub isotherm1_color: YCbCr,
     /// Second isotherm colour.
     pub isotherm2_color: YCbCr,
+    /// How the camera maps temperatures onto the ramp.
+    pub method: u8,
+    /// How far the ramp is stretched over the scene.
+    pub stretch: u8,
 }
 
 impl Palette {
@@ -344,6 +389,8 @@ impl Palette {
             underflow_color: color(0x0f),
             isotherm1_color: color(0x12),
             isotherm2_color: color(0x15),
+            method: bytes[0x1a],
+            stretch: bytes[0x1b],
         })
     }
 }
@@ -382,6 +429,59 @@ pub struct FrameMetadata {
 }
 
 impl FrameMetadata {
+    /// Metadata for a recording that is about to be written.
+    ///
+    /// Everything a [`CsqWriter`](crate::write::CsqWriter) cannot infer starts
+    /// out empty, so a caller fills in what they know and leaves the rest:
+    ///
+    /// ```
+    /// # let radiometric = csq::RadiometricParameters {
+    /// #     emissivity: 0.95, object_distance: 2.0,
+    /// #     reflected_apparent_temperature: 20.0, atmospheric_temperature: 20.0,
+    /// #     ir_window_temperature: 20.0, ir_window_transmission: 1.0,
+    /// #     relative_humidity: 50.0,
+    /// #     planck: csq::PlanckConstants { r1: 17096.453, b: 1428.0, f: 1.0, o: -342.0, r2: 0.046642166 },
+    /// #     atmospheric: csq::AtmosphericTransmission {
+    /// #         alpha1: 0.006569, alpha2: 0.012620, beta1: -0.002276, beta2: -0.006670, x: 1.9,
+    /// #     },
+    /// # };
+    /// let mut metadata = csq::FrameMetadata::new(640, 480, radiometric);
+    /// metadata.camera.model = "Bench rig".into();
+    /// metadata.frame_rate = Some(60.0);
+    /// ```
+    ///
+    /// The temperature range is derived from the calibration curve: it is the
+    /// span those Planck constants can express, which is the widest claim the
+    /// parameters support.
+    pub fn new(width: usize, height: usize, radiometric: RadiometricParameters) -> Self {
+        let (min, max) = radiometric.resolvable_span();
+
+        Self {
+            width,
+            height,
+            radiometric,
+            camera: CameraIdentity::default(),
+            temperature_range: TemperatureRange {
+                min,
+                max,
+                min_clip: min,
+                max_clip: max,
+                min_warn: min,
+                max_warn: max,
+                min_saturated: min,
+                max_saturated: max,
+            },
+            raw_value_range: RawValueRange::default(),
+            field_of_view: 0.0,
+            focus_distance: 0.0,
+            focus_step_count: 0,
+            frame_rate: None,
+            timestamp: None,
+            gps: None,
+            palette: None,
+        }
+    }
+
     /// Parses the camera-info record body.
     ///
     /// `width` and `height` come from the raw-data record, which is the
