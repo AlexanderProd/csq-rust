@@ -1,23 +1,23 @@
 //! The JPEG-LS encoding procedure of ITU-T T.87, Annex A.
 //!
-//! Structurally the decoder read backwards: the same contexts, the same
-//! predictor and the same reconstruction, from [`super::coding`]. Because both
-//! sides derive their state from the reconstructed image rather than the
-//! original one, near-lossless encoding stays in lockstep with decoding.
+//! The encoder and decoder share the contexts, predictor, and reconstruction
+//! logic in [`super::coding`]. Both update their state from reconstructed
+//! samples, which keeps near-lossless encoding and decoding synchronized.
 
 use super::bitwriter::BitWriter;
 use super::coding::{
-    map_error, marker, predict, CodingParameters, Context, RunContext, Traits, CONTEXT_COUNT, J,
+    map_error, marker, predict, CodingParameters, Context, GradientTable, RunContext, Traits,
+    CONTEXT_COUNT, J,
 };
 use super::JpegLsError;
 
-/// Sample precision FLIR writes, and the only one this encoder emits.
+/// The sample precision used by FLIR and by this encoder.
 const BITS_PER_SAMPLE: u32 = 16;
 
 /// Largest sample value at [`BITS_PER_SAMPLE`].
 const MAX_VALUE: i32 = 65535;
 
-/// How a JPEG-LS image is to be coded.
+/// Dimensions and error tolerance for a JPEG-LS image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodeOptions {
     /// Image width in samples.
@@ -30,7 +30,7 @@ pub struct EncodeOptions {
 }
 
 impl EncodeOptions {
-    /// Lossless coding of a `width` by `height` image.
+    /// Creates options for a lossless image of the given dimensions.
     pub fn lossless(width: usize, height: usize) -> Self {
         Self {
             width,
@@ -65,12 +65,11 @@ impl EncodeOptions {
     }
 }
 
-/// A reusable JPEG-LS encoder.
+/// Encodes 16-bit images as JPEG-LS streams.
 ///
-/// Like [`JpegLsDecoder`](super::JpegLsDecoder) it holds the line buffers, the
-/// context statistics and the output buffer, so encoding a sequence of
-/// same-sized frames does not allocate after the first one. That is what makes
-/// it usable on a live video feed.
+/// The encoder reuses its line buffers, statistics, and output buffer between
+/// calls. After the first frame, a stream of same-sized frames normally needs
+/// no further allocations.
 ///
 /// ```
 /// use csq::jpegls::{EncodeOptions, JpegLsEncoder};
@@ -87,13 +86,13 @@ impl EncodeOptions {
 pub struct JpegLsEncoder {
     contexts: Vec<Context>,
     run_contexts: [RunContext; 2],
-    /// Previous reconstructed line, offset by one so index `x` maps to `x + 1`
-    /// and slot `0` holds the `Rc` neighbour of the first column.
+    /// Previous reconstructed row, with one extra neighbour on each side.
     prev_line: Vec<u16>,
-    /// Current reconstructed line, same layout as `prev_line`.
+    /// Current reconstructed row, using the same layout as `prev_line`.
     curr_line: Vec<u16>,
     run_index: usize,
     writer: BitWriter,
+    gradients: GradientTable,
 }
 
 impl Default for JpegLsEncoder {
@@ -112,13 +111,14 @@ impl JpegLsEncoder {
             curr_line: Vec::new(),
             run_index: 0,
             writer: BitWriter::new(),
+            gradients: GradientTable::new(),
         }
     }
 
-    /// Encodes `samples` and returns the complete JPEG-LS stream.
+    /// Encodes a row-major image and returns its complete JPEG-LS stream.
     ///
-    /// The returned slice borrows the encoder's own buffer, which the next call
-    /// overwrites — copy it if it has to outlive that.
+    /// The returned slice is valid until the next call to `encode`. Copy it if
+    /// it must be kept longer.
     pub fn encode(
         &mut self,
         samples: &[u16],
@@ -129,10 +129,11 @@ impl JpegLsEncoder {
         let near = i32::from(options.near);
         let params = CodingParameters::defaults(MAX_VALUE, near);
         let traits = Traits::new(params, near);
+        self.gradients.prepare(&traits);
 
         self.writer.reset();
-        // Entropy coding all but never expands 16-bit imagery, so one byte per
-        // sample is a generous starting point that avoids regrowing mid-frame.
+        // One byte per sample is usually enough to avoid growing the output
+        // buffer while encoding.
         self.writer.reserve(samples.len() + 64);
         write_headers(&mut self.writer, &options, &params);
 
@@ -140,8 +141,8 @@ impl JpegLsEncoder {
         for row in samples.chunks_exact(options.width) {
             std::mem::swap(&mut self.prev_line, &mut self.curr_line);
 
-            // Ra of the first column is the sample directly above it, and Rd of
-            // the last column repeats Rb (T.87 § A.2).
+            // At the left edge, Ra is the sample above. At the right edge, Rd
+            // repeats Rb (T.87 § A.2).
             self.curr_line[0] = self.prev_line[1];
             let stride = options.width + 2;
             self.prev_line[stride - 1] = self.prev_line[stride - 2];
@@ -175,15 +176,16 @@ impl JpegLsEncoder {
         let mut x = 0usize;
 
         while x < width {
-            // Buffer slot `x + 1` holds column `x`, so `curr_line[x]` is Ra.
+            // Column x is stored at x + 1, making curr_line[x] its left
+            // neighbour Ra.
             let ra = i32::from(self.curr_line[x]);
             let rb = i32::from(self.prev_line[x + 1]);
             let rc = i32::from(self.prev_line[x]);
             let rd = i32::from(self.prev_line[x + 2]);
 
-            let q1 = traits.quantize(rd - rb);
-            let q2 = traits.quantize(rb - rc);
-            let q3 = traits.quantize(rc - ra);
+            let q1 = self.gradients.quantize(rd - rb);
+            let q2 = self.gradients.quantize(rb - rc);
+            let q3 = self.gradients.quantize(rc - ra);
 
             if q1 == 0 && q2 == 0 && q3 == 0 {
                 x = self.encode_run(traits, row, x, ra);
@@ -196,10 +198,9 @@ impl JpegLsEncoder {
         }
     }
 
-    /// Regular-mode sample encoding (T.87 § A.4 to A.6).
+    /// Encodes one non-run sample using regular mode (T.87 § A.4 to A.6).
     ///
-    /// Returns the reconstructed sample, which is what the following samples —
-    /// and the decoder — predict from.
+    /// Returns the reconstructed value used to predict later samples.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn encode_regular(
@@ -222,8 +223,7 @@ impl JpegLsEncoder {
         let k = context.golomb_k();
         let err = traits.modulo_range(traits.quantize_error(sign * (sample - px)));
 
-        // The bias inversion is an exclusive-or the decoder undoes with the
-        // same context state, so the statistics still see the plain error.
+        // The decoder applies the same XOR to recover the original error.
         let correction = if k == 0 {
             context.error_correction(traits.near)
         } else {
@@ -238,22 +238,35 @@ impl JpegLsEncoder {
         );
         context.update(err, traits.near, traits.reset);
 
+        // In lossless mode, reconstruction always equals the input sample.
+        if traits.near == 0 {
+            return sample;
+        }
         traits.reconstruct(px, err * sign)
     }
 
-    /// Run mode: a run of samples within `NEAR` of `Ra`, optionally followed by
-    /// a run interruption sample (T.87 § A.7).
+    /// Encodes a sequence close to `Ra`, followed by an optional interruption
+    /// sample (T.87 § A.7).
     fn encode_run(&mut self, traits: &Traits, row: &[u16], x: usize, ra: i32) -> usize {
         let width = row.len();
 
-        let mut count = 0usize;
-        while x + count < width && (i32::from(row[x + count]) - ra).abs() <= traits.near {
-            count += 1;
-        }
+        let count = if traits.near == 0 {
+            // In lossless mode, direct equality is sufficient and cheaper.
+            let value = ra as u16;
+            row[x..]
+                .iter()
+                .take_while(|&&sample| sample == value)
+                .count()
+        } else {
+            row[x..]
+                .iter()
+                .take_while(|&&sample| (i32::from(sample) - ra).abs() <= traits.near)
+                .count()
+        };
         self.curr_line[x + 1..x + 1 + count].fill(ra as u16);
 
-        // A run that reaches the end of the line needs no terminator: the
-        // decoder stops there on its own.
+        // The decoder already knows the row width, so an end-of-row run needs
+        // no terminator.
         let end_of_line = x + count == width;
         let mut remaining = count;
         while remaining >= (1usize << J[self.run_index]) {
@@ -307,7 +320,8 @@ impl JpegLsEncoder {
         let context = &mut self.run_contexts[ri_type];
         let k = context.golomb_k();
 
-        // The sign travels as a parity bit on the magnitude (T.87 § A.7.2.2).
+        // Store the sign as the parity of the mapped magnitude
+        // (T.87 § A.7.2.2).
         let mapped = 2 * err.abs() - ri_type as i32 - context.error_map(err, k);
         debug_assert!(
             mapped >= 0,
@@ -319,7 +333,8 @@ impl JpegLsEncoder {
     }
 }
 
-/// Limited-length Golomb coding (T.87 § A.5.3).
+/// Writes a non-negative value using JPEG-LS's length-limited Golomb code
+/// (T.87 § A.5.3).
 #[inline]
 fn encode_value(writer: &mut BitWriter, k: u32, mapped: i32, limit: i32, qbpp: u32) {
     let high_bits = mapped >> k;
@@ -331,17 +346,19 @@ fn encode_value(writer: &mut BitWriter, k: u32, mapped: i32, limit: i32, qbpp: u
             writer.push_bits(mapped as u32 & ((1u32 << k) - 1), k);
         }
     } else {
-        // Too long to code directly: an escape prefix followed by the value.
+        // Use the fixed-width escape form when the unary prefix would be too
+        // long.
         writer.push_unary(escape_at as u32);
         writer.push_bits((mapped - 1) as u32 & ((1u32 << qbpp) - 1), qbpp);
     }
 }
 
-/// Writes SOI, the frame header, the coding parameters and SOS.
+/// Writes the JPEG-LS start marker, frame header, coding parameters, and scan
+/// header.
 ///
-/// The LSE segment is redundant — the values in it are the defaults T.87 would
-/// derive anyway — but FLIR's own encoder emits one, so files written here look
-/// the same to a reader that only handles what FLIR produces.
+/// The LSE segment contains the standard defaults and is technically optional.
+/// It is included for compatibility with software that expects FLIR-style
+/// output.
 fn write_headers(writer: &mut BitWriter, options: &EncodeOptions, params: &CodingParameters) {
     let be16 = |value: i32| (value as u16).to_be_bytes();
     let [h1, h0] = be16(options.height as i32);
@@ -414,7 +431,7 @@ mod tests {
         decoded
     }
 
-    /// A deterministic pseudo-random image, the hardest case for the coder.
+    /// Creates deterministic noise that is difficult to compress.
     fn noise(width: usize, height: usize) -> Vec<u16> {
         let mut state = 0x2545_f491_4f6c_dd1du64;
         (0..width * height)
@@ -427,7 +444,7 @@ mod tests {
             .collect()
     }
 
-    /// Something closer to real thermal data: a smooth gradient with detail.
+    /// Creates a smooth image with local detail, similar to thermal data.
     fn scene(width: usize, height: usize) -> Vec<u16> {
         (0..height)
             .flat_map(|y| {
@@ -514,7 +531,7 @@ mod tests {
 
     #[test]
     fn extreme_sample_values_round_trip() {
-        // 0 and MAXVAL exercise the prediction clamps at both ends.
+        // Exercise prediction clamping at both ends of the sample range.
         let image = vec![0u16, 65535, 0, 65535, 32768, 1, 65534, 0];
         assert_eq!(round_trip(&image, EncodeOptions::lossless(4, 2)), image);
     }
@@ -547,8 +564,7 @@ mod tests {
 
     #[test]
     fn writes_the_stream_flir_writes() {
-        // The header bytes are compared against a real T1020 frame, so a change
-        // to what is emitted shows up here rather than in a viewer.
+        // Compare the header with a real T1020 frame.
         let mut encoder = JpegLsEncoder::new();
         let stream = encoder
             .encode(

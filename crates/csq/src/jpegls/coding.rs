@@ -45,6 +45,7 @@ pub(super) struct Context {
 }
 
 impl Context {
+    /// Creates a regular-mode context with the given initial error total.
     pub(super) fn new(a: i32) -> Self {
         Self {
             a,
@@ -54,21 +55,18 @@ impl Context {
         }
     }
 
-    /// Golomb parameter k (T.87 § A.5.1).
+    /// Chooses the Golomb-Rice parameter `k` from this context's statistics
+    /// (T.87 § A.5.1).
     #[inline]
     pub(super) fn golomb_k(&self) -> u32 {
-        let mut k = 0;
-        while k < 31 && (self.n << k) < self.a {
-            k += 1;
-        }
-        k
+        smallest_shift(self.n, self.a)
     }
 
-    /// Bias-inversion flag used for `k == 0` in lossless mode (T.87 § A.5.2).
+    /// Returns the lossless-mode correction used before mapping an error
+    /// (T.87 § A.5.2).
     ///
-    /// Returns `0` or `-1`, so applying it is an exclusive-or in both
-    /// directions: the encoder maps `errval ^ correction`, the decoder undoes
-    /// it with the same value.
+    /// The result is either `0` (leave the error unchanged) or `-1` (invert
+    /// every bit). Applying the same XOR again restores the original error.
     #[inline]
     pub(super) fn error_correction(&self, near: i32) -> i32 {
         if near != 0 || 2 * self.b + self.n > 0 {
@@ -78,7 +76,11 @@ impl Context {
         }
     }
 
-    /// Variable and bias update (T.87 § A.6.1 and A.6.2).
+    /// Updates this context after coding one prediction error.
+    ///
+    /// This records the error's magnitude and bias, periodically scales the
+    /// totals down, and adjusts the prediction correction `C`
+    /// (T.87 § A.6.1 and A.6.2).
     #[inline]
     pub(super) fn update(&mut self, err: i32, near: i32, reset: i32) {
         self.a += err.abs();
@@ -111,6 +113,24 @@ impl Context {
     }
 }
 
+/// Finds the smallest Golomb parameter `k` for which `n * 2^k >= a`.
+///
+/// JPEG-LS limits `k` to 31. Comparing the bit lengths of `n` and `a` avoids
+/// the loop shown in the standard; one final comparison corrects the result
+/// when their leading bits alone are not enough.
+#[inline]
+fn smallest_shift(n: i32, a: i32) -> u32 {
+    debug_assert!(n > 0);
+    if n >= a {
+        return 0;
+    }
+    // `a` is the larger, so it has no more leading zeros than `n`, and `n`
+    // shifted by the difference is as long as `a` without overflowing.
+    let k = n.leading_zeros() - a.leading_zeros();
+    let k = if n << k >= a { k } else { k + 1 };
+    k.min(31)
+}
+
 /// Statistics for the two run-interruption contexts (T.87 § A.7.2).
 #[derive(Clone, Copy)]
 pub(super) struct RunContext {
@@ -122,6 +142,10 @@ pub(super) struct RunContext {
 }
 
 impl RunContext {
+    /// Creates one of the two run-interruption contexts.
+    ///
+    /// `ri_type` is `0` when the interruption sample differs from `Rb` by
+    /// more than `NEAR`, and `1` otherwise.
     pub(super) fn new(a: i32, ri_type: i32) -> Self {
         Self {
             a,
@@ -131,31 +155,24 @@ impl RunContext {
         }
     }
 
+    /// Chooses the Golomb-Rice parameter `k` for run-interruption coding.
     #[inline]
     pub(super) fn golomb_k(&self) -> u32 {
         let temp = self.a + (self.n >> 1) * self.ri_type;
-        let mut n_temp = self.n;
-        let mut k = 0;
-        while k < 31 && n_temp < temp {
-            n_temp <<= 1;
-            k += 1;
-        }
-        k
+        smallest_shift(self.n, temp)
     }
 
-    /// Which sign the transmitted parity bit stands for.
+    /// Returns whether a parity bit of one represents a negative error.
     ///
-    /// The encoder sets its `map` flag with
-    /// `(k == 0 && e > 0 && 2*Nn < N) || (e < 0 && 2*Nn >= N) || (e < 0 && k != 0)`,
-    /// which for a fixed magnitude is complementary between the two candidate
-    /// signs. This is the half of that condition the sign does not enter into,
-    /// so both directions can share it.
+    /// The meaning depends on `k` and on whether this context has seen mostly
+    /// positive or negative errors.
     #[inline]
     fn negative_maps_to_one(&self, k: u32) -> bool {
         k != 0 || 2 * self.nn >= self.n
     }
 
-    /// The parity flag to transmit for `errval` (T.87 § A.7.2.2).
+    /// Maps the sign of `errval` to the parity flag written to the stream
+    /// (T.87 § A.7.2.2).
     #[inline]
     pub(super) fn error_map(&self, errval: i32, k: u32) -> i32 {
         let negative_maps_to_one = self.negative_maps_to_one(k);
@@ -167,10 +184,11 @@ impl RunContext {
         i32::from(map)
     }
 
-    /// Inverse of the run-interruption error mapping (T.87 § A.7.2.2).
+    /// Restores a signed run-interruption error from its mapped value
+    /// (T.87 § A.7.2.2).
     ///
-    /// `temp` is the transmitted value with `RItype` added back, so its low bit
-    /// is the parity flag and the rest is twice the magnitude.
+    /// `temp` is the transmitted value plus `RItype`. Its low bit carries the
+    /// sign mapping, while the remaining bits carry the error magnitude.
     #[inline]
     pub(super) fn compute_errval(&self, temp: i32, k: u32) -> i32 {
         let map = temp & 1 != 0;
@@ -182,6 +200,10 @@ impl RunContext {
         }
     }
 
+    /// Updates this context after coding one run-interruption error.
+    ///
+    /// `mapped` is the non-negative error value written to or read from the
+    /// Golomb coder.
     #[inline]
     pub(super) fn update(&mut self, errval: i32, mapped: i32, reset: i32) {
         if errval < 0 {
@@ -209,7 +231,8 @@ pub(super) struct CodingParameters {
 }
 
 impl CodingParameters {
-    /// Default thresholds for a given `MAXVAL` and `NEAR`.
+    /// Derives the standard JPEG-LS thresholds and reset value for `MAXVAL`
+    /// and `NEAR`.
     pub(super) fn defaults(max_value: i32, near: i32) -> Self {
         const BASIC_T1: i32 = 3;
         const BASIC_T2: i32 = 7;
@@ -261,7 +284,9 @@ pub(super) struct Traits {
     t3: i32,
 }
 
-/// Smallest `x` with `2^x >= n`.
+/// Returns the number of bits needed to represent `n` distinct values.
+///
+/// In mathematical terms, this is the smallest `x` for which `2^x >= n`.
 pub(super) fn ceil_log2(n: i32) -> u32 {
     let mut x = 0;
     while n > (1 << x) {
@@ -271,6 +296,8 @@ pub(super) fn ceil_log2(n: i32) -> u32 {
 }
 
 impl Traits {
+    /// Derives the values used while coding a scan from its parameters and
+    /// allowed per-sample error.
     pub(super) fn new(params: CodingParameters, near: i32) -> Self {
         let max_value = params.max_value;
         let range = (max_value + 2 * near) / (2 * near + 1) + 1;
@@ -288,12 +315,14 @@ impl Traits {
         }
     }
 
-    /// The initial value of every context's `A` statistic (T.87 § A.3.4).
+    /// Returns the starting accumulated error (`A`) for every context
+    /// (T.87 § A.3.4).
     pub(super) fn initial_a(&self) -> i32 {
         ((self.range + 32) / 64).max(2)
     }
 
-    /// Gradient quantisation (T.87 § A.3.3).
+    /// Places a neighbouring-sample difference into one of nine gradient
+    /// buckets, numbered `-4` through `4` (T.87 § A.3.3).
     #[inline]
     pub(super) fn quantize(&self, d: i32) -> i32 {
         if d <= -self.t3 {
@@ -317,13 +346,15 @@ impl Traits {
         }
     }
 
-    /// Clamps a prediction into `[0, MAXVAL]` (T.87 § A.4.2).
+    /// Restricts a predicted sample to the valid range `0..=MAXVAL`
+    /// (T.87 § A.4.2).
     #[inline]
     pub(super) fn correct_prediction(&self, px: i32) -> i32 {
         px.clamp(0, self.max_value)
     }
 
-    /// Near-lossless quantisation of a prediction error (T.87 § A.4.4).
+    /// Reduces a prediction error to the precision required by `NEAR`
+    /// (T.87 § A.4.4).
     ///
     /// A no-op when the stream is lossless.
     #[inline]
@@ -339,7 +370,8 @@ impl Traits {
         }
     }
 
-    /// Folds an error into the representable range (T.87 § A.4.5).
+    /// Wraps a prediction error into JPEG-LS's signed coding range
+    /// (T.87 § A.4.5).
     #[inline]
     pub(super) fn modulo_range(&self, mut error: i32) -> i32 {
         if error < 0 {
@@ -351,8 +383,8 @@ impl Traits {
         error
     }
 
-    /// Reconstructs a sample from its prediction and quantised error
-    /// (T.87 § A.4.5 and A.6.3).
+    /// Rebuilds a sample from its prediction and quantised error, wrapping and
+    /// clamping the result when necessary (T.87 § A.4.5 and A.6.3).
     #[inline]
     pub(super) fn reconstruct(&self, px: i32, err: i32) -> i32 {
         let mut value = px + err * (2 * self.near + 1);
@@ -366,7 +398,67 @@ impl Traits {
     }
 }
 
-/// The median edge detector, JPEG-LS's fixed predictor (T.87 § A.4.2).
+/// [`Traits::quantize`] as a table, for loops that quantise three gradients a
+/// sample.
+///
+/// The standard's chain of comparisons is cheap when its branches are
+/// predicted, but thermal images put gradients near a threshold often enough
+/// that a Raspberry Pi 4 mispredicts two of them a pixel. Counting crossed
+/// thresholds without branches is no general cure: the compiler vectorises
+/// it into a longer chain of dependent operations than the one it replaces,
+/// which Apple's cores wait on long enough to end up slower than with the
+/// branches. A lookup has no data-dependent branch and a short chain, and
+/// was the fastest of the three on both — almost a quarter off the encoder's
+/// time on the Pi, a seventh on an M1.
+///
+/// Beyond the largest threshold the answer no longer changes, so the table
+/// only covers the gradients up to it and clamps the rest — a few hundred
+/// bytes that stay in the L1 cache.
+pub(super) struct GradientTable {
+    /// Quantised values for the gradients `-bound..=bound`.
+    values: Vec<i8>,
+    bound: i32,
+    /// The parameters the table was built for.
+    built_for: Option<(i32, i32, i32, i32)>,
+}
+
+impl GradientTable {
+    /// Creates an empty table. Call [`Self::prepare`] before using it.
+    pub(super) fn new() -> Self {
+        Self {
+            values: Vec::new(),
+            bound: 0,
+            built_for: None,
+        }
+    }
+
+    /// Builds the lookup table for `traits`, or keeps the existing table when
+    /// the relevant thresholds have not changed.
+    pub(super) fn prepare(&mut self, traits: &Traits) {
+        let key = (traits.near, traits.t1, traits.t2, traits.t3);
+        if self.built_for == Some(key) {
+            return;
+        }
+        // Past every threshold, and past NEAR, the comparisons all come out
+        // the same way, whatever order the thresholds are in.
+        self.bound = traits.t1.max(traits.t2).max(traits.t3).max(traits.near + 1);
+        self.values.clear();
+        self.values
+            .extend((-self.bound..=self.bound).map(|d| traits.quantize(d) as i8));
+        self.built_for = Some(key);
+    }
+
+    /// Quantises a gradient using the traits passed to the last
+    /// [`Self::prepare`] call.
+    #[inline]
+    pub(super) fn quantize(&self, d: i32) -> i32 {
+        i32::from(self.values[(d.clamp(-self.bound, self.bound) + self.bound) as usize])
+    }
+}
+
+/// Predicts the next sample from its left (`Ra`), upper (`Rb`), and
+/// upper-left (`Rc`) neighbours using JPEG-LS's median edge detector
+/// (T.87 § A.4.2).
 #[inline]
 pub(super) fn predict(ra: i32, rb: i32, rc: i32) -> i32 {
     if rc >= ra.max(rb) {
@@ -378,7 +470,8 @@ pub(super) fn predict(ra: i32, rb: i32, rc: i32) -> i32 {
     }
 }
 
-/// The Rice error mapping onto non-negative values (T.87 § A.5.2).
+/// Maps a signed prediction error to a non-negative integer for Golomb-Rice
+/// coding (T.87 § A.5.2).
 #[inline]
 pub(super) fn map_error(error: i32) -> i32 {
     if error >= 0 {
@@ -388,7 +481,7 @@ pub(super) fn map_error(error: i32) -> i32 {
     }
 }
 
-/// Inverse of [`map_error`].
+/// Restores a signed prediction error produced by [`map_error`].
 #[inline]
 pub(super) fn unmap_error(mapped: i32) -> i32 {
     if mapped & 1 != 0 {
@@ -463,6 +556,52 @@ mod tests {
         let traits = Traits::new(CodingParameters::defaults(65535, 0), 0);
         for error in [-1000, -1, 0, 1, 1000] {
             assert_eq!(traits.quantize_error(error), error);
+        }
+    }
+
+    #[test]
+    fn the_gradient_table_matches_the_standard() {
+        let unordered = CodingParameters {
+            max_value: 65535,
+            t1: 40,
+            t2: 12,
+            t3: 25,
+            reset: 64,
+        };
+        let cases = [0, 1, 5, 16, 255]
+            .map(|near| (CodingParameters::defaults(65535, near), near))
+            .into_iter()
+            .chain([(unordered, 0), (unordered, 60)]);
+
+        let mut table = GradientTable::new();
+        for (params, near) in cases {
+            let traits = Traits::new(params, near);
+            table.prepare(&traits);
+            // Every difference two 16-bit samples can have.
+            for d in -65535..=65535 {
+                assert_eq!(
+                    table.quantize(d),
+                    traits.quantize(d),
+                    "near {near}, thresholds {:?}, d {d}",
+                    (params.t1, params.t2, params.t3)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_golomb_parameter_matches_the_standards_loop() {
+        let reference = |n: i32, a: i32| {
+            let mut k = 0;
+            while k < 31 && (n << k) < a {
+                k += 1;
+            }
+            k
+        };
+        for n in 1..=130 {
+            for a in (0..5000).chain([65_535, 1 << 20, (1 << 30) - 1]) {
+                assert_eq!(smallest_shift(n, a), reference(n, a), "n {n}, a {a}");
+            }
         }
     }
 
