@@ -1,9 +1,8 @@
 //! Writing CSQ recordings.
 //!
-//! A [`CsqWriter`] takes frames of temperatures and appends them to any
-//! [`Write`] sink as complete FFF frames — the same container FLIR's own
-//! recorder produces, with the calibration a viewer needs to turn the counts
-//! back into °C.
+//! [`CsqWriter`] converts thermal frames into the FFF frame format used by FLIR
+//! recordings and appends them to any [`Write`] destination. Each frame stores
+//! the calibration data needed to convert detector counts back to temperatures.
 //!
 //! ```no_run
 //! # fn main() -> csq::Result<()> {
@@ -26,37 +25,26 @@
 //!
 //! # What has to be supplied
 //!
-//! Temperatures are not what a CSQ file stores. The camera records raw detector
-//! counts, and a reader turns those into °C with the Planck constants and scene
-//! parameters in the frame — so writing runs that backwards, and the
-//! [`RadiometricParameters`] are not optional decoration. Whatever is written
-//! there is what a viewer will measure with. The most reliable source is a
-//! recording from the camera the data came from; failing that, the constants
-//! decide the mapping and any self-consistent set round-trips exactly.
+//! CSQ files store detector counts rather than temperatures. Writing
+//! temperatures therefore requires [`RadiometricParameters`] to perform the
+//! reverse conversion. These values also determine the temperatures shown by a
+//! reader. When possible, copy them from a recording made by the same camera.
 //!
-//! Everything else — camera and lens identification, capture time, GPS,
-//! display palette — is carried through if given and left empty if not.
+//! Other metadata, such as camera details, timestamps, GPS, and palette, is
+//! optional.
 //!
 //! # Keeping up with a live feed
 //!
-//! Frames are independent, so writing is a streaming operation with no index to
-//! fix up at the end and nothing buffered beyond the frames in hand. The cost
-//! is dominated by JPEG-LS encoding, which by default runs on a small pool of
-//! worker threads while frames still reach the sink in recording order. On a
-//! ten-core M-series Mac that writes 640×480 at around 1000 fps and 1024×768 at
-//! around 350, against 130 and 50 on one core — so the pool is the difference
-//! between keeping up with a 60 fps feed at a large sensor and not.
+//! Frames are encoded independently and written in recording order. By default,
+//! JPEG-LS encoding runs on a small worker pool for better throughput.
 //!
-//! [`write`](CsqWriter::write) hands a frame over and returns, blocking only
-//! when the encoders are already a couple of frames behind, so a producer
-//! running at frame rate stays at frame rate. Errors from a frame that was
-//! still being encoded surface on a later [`write`](CsqWriter::write) or on
-//! [`finish`](CsqWriter::finish), which is the trade for not waiting.
+//! [`write`](CsqWriter::write) normally returns after queuing the frame. It
+//! blocks only when the worker queue is full. Because encoding is asynchronous,
+//! an error may be reported by a later `write` call or by
+//! [`finish`](CsqWriter::finish).
 //!
-//! [`WriteOptions::single_threaded`] turns that off and encodes each frame
-//! before returning. Both paths produce the same bytes, and neither allocates
-//! per frame once warm — the encoder, the count buffer and the frame buffers
-//! are all recycled.
+//! Use [`WriteOptions::single_threaded`] to encode each frame before `write`
+//! returns. Both modes produce the same output and reuse their buffers.
 
 mod frame;
 mod pipeline;
@@ -72,20 +60,19 @@ use crate::thermal::RadiometricParameters;
 use frame::FrameEncoder;
 use pipeline::Pipeline;
 
-/// How the thermal image of each frame is coded.
+/// Controls the accuracy and size of the encoded thermal image.
 ///
-/// Cameras code near-lossless, and vary the bound from frame to frame to hold a
-/// bitrate. A recording written here holds whatever bound it was given.
+/// FLIR cameras commonly use near-lossless compression and adjust the error
+/// bound to control bitrate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Compression {
-    /// Every count comes back exactly as it went in.
+    /// Preserves every detector count exactly.
     #[default]
     Lossless,
-    /// No count moves by more than `near`, in exchange for a much smaller file.
+    /// Allows each detector count to change by at most `near` for better
+    /// compression.
     ///
-    /// Cameras use 4 to 16 depending on the scene. What that is worth in
-    /// temperature depends on the calibration: it is a bound on counts, and
-    /// around room temperature a count is a small fraction of a degree.
+    /// The temperature effect depends on the camera calibration.
     NearLossless {
         /// The error bound, in detector counts.
         near: u16,
@@ -95,20 +82,17 @@ pub enum Compression {
 /// Settings for a [`CsqWriter`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteOptions {
-    /// How to code the thermal image.
+    /// Compression used for each thermal image.
     pub compression: Compression,
-    /// The producer name written into every frame header.
+    /// Producer name stored in every frame header.
     ///
-    /// Cameras write `RTP`, which is what a reader expecting camera output will
-    /// find familiar. At most 15 bytes are kept.
+    /// The default is FLIR's `RTP`. Only the first 15 bytes are stored.
     pub creator: String,
-    /// Encoder threads.
+    /// Number of encoder threads.
     ///
-    /// `0`, the default, picks a count from the machine. `1` encodes on the
-    /// calling thread and writes each frame before returning; anything higher
-    /// uses that many workers. Frames reach the sink in order and come out
-    /// byte-for-byte the same whichever is chosen — only the throughput and the
-    /// point at which errors surface differ.
+    /// `0` selects a worker count automatically. `1` encodes on the calling
+    /// thread. Larger values create that many workers. Thread count affects
+    /// performance and when errors are reported, but not the output bytes.
     pub threads: usize,
 }
 
@@ -123,13 +107,10 @@ impl Default for WriteOptions {
 }
 
 impl WriteOptions {
-    /// Encoding on the calling thread, with each frame written before
-    /// [`write`](CsqWriter::write) returns.
+    /// Creates options that encode and write each frame on the calling thread.
     ///
-    /// Worth choosing when the caller has its own idea about threads, or wants
-    /// every error reported by the call that caused it. One core encodes a
-    /// 640×480 frame in about seven milliseconds, so this keeps up with a
-    /// 60 fps feed at that size but not at 1024×768.
+    /// This is useful when the application manages its own threads or needs an
+    /// error to be returned by the exact `write` call that caused it.
     pub fn single_threaded() -> Self {
         Self {
             threads: 1,
@@ -143,37 +124,53 @@ impl WriteOptions {
         self
     }
 
-    /// Sets the number of encoder threads; `0` picks a count from the machine.
+    /// Sets the encoder thread count. `0` selects it automatically.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads;
         self
     }
 
-    /// How many worker threads to actually start.
+    /// Resolves the configured thread count to the number actually used.
     fn worker_count(&self) -> usize {
         match self.threads {
-            1 => 1,
-            0 => std::thread::available_parallelism().map_or(1, |n| n.get().clamp(1, 8)),
+            0 => {
+                std::thread::available_parallelism().map_or(1, |cores| default_workers(cores.get()))
+            }
             n => n,
         }
     }
 }
 
-/// The pixels of one frame.
+/// Number of CPU cores reserved for frame capture and other application work.
+///
+/// Using every core for encoding can delay a live camera's capture loop.
+const PRODUCER_CORES: usize = 2;
+
+/// Chooses the automatic worker count for a machine with `cores` CPU cores.
+///
+/// Multi-core systems use between two and eight workers while reserving
+/// [`PRODUCER_CORES`] cores when possible.
+fn default_workers(cores: usize) -> usize {
+    match cores {
+        1 => 1,
+        cores => cores.saturating_sub(PRODUCER_CORES).clamp(2, 8),
+    }
+}
+
+/// Pixel data accepted for one frame.
 #[derive(Debug, Clone, Copy)]
 pub enum FramePixels<'a> {
     /// Temperatures in °C. `NaN` marks a pixel with no reading.
     Celsius(&'a [f32]),
     /// Temperatures in kelvin.
     Kelvin(&'a [f32]),
-    /// Raw detector counts, already in the form the file stores.
+    /// Raw detector counts in the format stored by CSQ.
     Raw(&'a [u16]),
 }
 
-/// One frame on its way into a recording.
+/// A thermal frame and its optional per-frame metadata.
 ///
-/// The pixels are required; everything else is per-frame detail that overrides
-/// what the recording's metadata says.
+/// Per-frame metadata overrides the recording-wide defaults.
 ///
 /// ```
 /// # let celsius = vec![20.0f32; 16];
@@ -192,26 +189,24 @@ pub struct WriteFrame<'a> {
 }
 
 impl<'a> WriteFrame<'a> {
-    /// A frame of temperatures in °C, in row-major order.
+    /// Creates a frame from row-major temperatures in °C.
     pub fn celsius(celsius: &'a [f32]) -> Self {
         Self::new(FramePixels::Celsius(celsius))
     }
 
-    /// A frame of temperatures in kelvin, in row-major order.
+    /// Creates a frame from row-major temperatures in kelvin.
     pub fn kelvin(kelvin: &'a [f32]) -> Self {
         Self::new(FramePixels::Kelvin(kelvin))
     }
 
-    /// A frame of raw detector counts, in row-major order.
+    /// Creates a frame from row-major detector counts.
     ///
-    /// The fastest and most faithful input when the counts are already at hand
-    /// — copying frames out of another recording, for instance — because
-    /// nothing is converted on the way in.
+    /// No temperature conversion is performed.
     pub fn raw(counts: &'a [u16]) -> Self {
         Self::new(FramePixels::Raw(counts))
     }
 
-    /// A frame from any of the pixel forms.
+    /// Creates a frame from any supported pixel representation.
     pub fn new(pixels: FramePixels<'a>) -> Self {
         Self {
             pixels,
@@ -227,37 +222,35 @@ impl<'a> WriteFrame<'a> {
         self
     }
 
-    /// Attaches a position fix.
+    /// Sets the frame's GPS position.
     pub fn with_gps(mut self, gps: GpsInfo) -> Self {
         self.gps = Some(gps);
         self
     }
 
-    /// Overrides the scene and calibration parameters for this frame.
+    /// Sets scene and calibration parameters for this frame.
     ///
-    /// Both the conversion from temperatures and the parameters recorded in the
-    /// frame follow, so a recording whose emissivity or object distance changes
-    /// part-way through stays readable.
+    /// These parameters are used for temperature conversion and stored in the
+    /// output frame.
     pub fn with_radiometric(mut self, parameters: RadiometricParameters) -> Self {
         self.radiometric = Some(parameters);
         self
     }
 
-    /// The pixels this frame carries.
+    /// Returns this frame's pixel data.
     pub fn pixels(&self) -> FramePixels<'a> {
         self.pixels
     }
 }
 
-/// Creates a CSQ file and returns a writer for it.
+/// Creates a buffered CSQ file using the default write options.
 ///
-/// The file is buffered, so a caller handing over one frame at a time does not
-/// pay for a write syscall per record.
+/// Buffering avoids a separate system call for every record.
 pub fn create(path: impl AsRef<Path>, metadata: FrameMetadata) -> Result<CsqWriter<BufFile>> {
     create_with_options(path, metadata, WriteOptions::default())
 }
 
-/// [`create`], with settings.
+/// Creates a buffered CSQ file using custom write options.
 pub fn create_with_options(
     path: impl AsRef<Path>,
     metadata: FrameMetadata,
@@ -267,43 +260,40 @@ pub fn create_with_options(
     CsqWriter::with_options(file, metadata, options)
 }
 
-/// The sink [`create`] writes through.
+/// Buffered file type returned by [`create`] and [`create_with_options`].
 pub type BufFile = std::io::BufWriter<std::fs::File>;
 
-/// Appends frames to a CSQ recording.
+/// Streams thermal frames into a CSQ recording.
 ///
-/// A recording is a bare concatenation of frames, so there is no header to
-/// write up front and no index to fix up at the end — but [`finish`] still has
-/// to be called to flush the sink and report anything that went wrong. Dropping
-/// a writer flushes what it can and discards the errors.
+/// Call [`finish`] to encode pending frames, flush the sink, and receive any
+/// final error. Dropping the writer attempts to finish but cannot report
+/// failures.
 ///
 /// [`finish`]: CsqWriter::finish
 pub struct CsqWriter<W: Write> {
     sink: Option<W>,
     encoding: Encoding,
-    /// Reused whenever frames are encoded on this thread.
+    /// Output buffer reused by single-threaded encoding.
     buffer: Vec<u8>,
     frames_written: u64,
     bytes_written: u64,
-    /// Set once an error has been reported, because the recording is then
-    /// missing a frame and every later one would be silently misplaced.
+    /// Prevents further writes after an error leaves the recording incomplete.
     failed: bool,
 }
 
-/// Where frames are encoded.
+/// Selects single-threaded or worker-pool encoding.
 enum Encoding {
     Inline(Box<FrameEncoder>),
     Pooled(Box<Pipeline>),
 }
 
 impl<W: Write> CsqWriter<W> {
-    /// Starts a recording with the default settings: lossless, encoded on a
-    /// pool of worker threads.
+    /// Creates a lossless writer using the default thread settings.
     pub fn new(sink: W, metadata: FrameMetadata) -> Result<Self> {
         Self::with_options(sink, metadata, WriteOptions::default())
     }
 
-    /// Starts a recording with the given settings.
+    /// Creates a writer with custom compression and thread settings.
     pub fn with_options(sink: W, metadata: FrameMetadata, options: WriteOptions) -> Result<Self> {
         let workers = options.worker_count();
         let encoding = if workers <= 1 {
@@ -322,7 +312,7 @@ impl<W: Write> CsqWriter<W> {
         })
     }
 
-    /// The frame geometry this recording was opened with.
+    /// Returns the required frame width and height.
     pub fn dimensions(&self) -> (usize, usize) {
         match &self.encoding {
             Encoding::Inline(encoder) => encoder.dimensions(),
@@ -330,7 +320,7 @@ impl<W: Write> CsqWriter<W> {
         }
     }
 
-    /// How many frames have been handed over.
+    /// Returns the number of frames accepted by the writer.
     ///
     /// With encoder threads some of them may still be in flight; [`finish`]
     /// is what guarantees they have reached the sink.
@@ -340,26 +330,25 @@ impl<W: Write> CsqWriter<W> {
         self.frames_written
     }
 
-    /// How many bytes have reached the sink so far.
+    /// Returns the number of bytes written to the sink so far.
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written
     }
 
-    /// Appends a frame of temperatures in °C.
+    /// Writes one frame of row-major temperatures in °C.
     pub fn write_celsius(&mut self, celsius: &[f32]) -> Result<()> {
         self.write(WriteFrame::celsius(celsius))
     }
 
-    /// Appends a frame of raw detector counts.
+    /// Writes one frame of row-major detector counts.
     pub fn write_raw(&mut self, counts: &[u16]) -> Result<()> {
         self.write(WriteFrame::raw(counts))
     }
 
-    /// Appends a frame.
+    /// Submits one frame for encoding and writing.
     ///
-    /// With encoder threads this returns as soon as the frame has been queued,
-    /// and blocks only when the queue is full — so a producer running at frame
-    /// rate stays at frame rate.
+    /// With multiple encoder threads, this usually returns after queueing the
+    /// frame and blocks only while the queue is full.
     pub fn write(&mut self, frame: WriteFrame<'_>) -> Result<()> {
         if self.failed {
             return Err(Error::Unwritable {
@@ -391,7 +380,7 @@ impl<W: Write> CsqWriter<W> {
         Ok(())
     }
 
-    /// Finishes the recording and returns the sink.
+    /// Finishes all pending work, flushes, and returns the output sink.
     ///
     /// Waits for any frames still being encoded, writes them, and flushes.
     pub fn finish(mut self) -> Result<W> {
@@ -401,7 +390,7 @@ impl<W: Write> CsqWriter<W> {
         Ok(sink)
     }
 
-    /// Writes out everything still in flight.
+    /// Writes all frames still being processed by the worker pool.
     fn drain(&mut self) -> Result<()> {
         let Some(sink) = self.sink.as_mut() else {
             return Ok(());
@@ -415,8 +404,8 @@ impl<W: Write> CsqWriter<W> {
 
 impl<W: Write> Drop for CsqWriter<W> {
     fn drop(&mut self) {
-        // A caller who never reached `finish` still gets a complete file where
-        // that is possible; there is nowhere to report a failure to here.
+        // Best-effort cleanup for callers that did not call finish. Errors
+        // cannot be reported from Drop.
         if self.sink.is_some() && !self.failed {
             let _ = self.drain();
             if let Some(sink) = self.sink.as_mut() {
@@ -433,5 +422,20 @@ impl<W: Write> std::fmt::Debug for CsqWriter<W> {
             .field("frames_written", &self.frames_written)
             .field("bytes_written", &self.bytes_written)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_workers;
+
+    #[test]
+    fn the_default_leaves_cores_for_the_producer() {
+        assert_eq!(default_workers(1), 1);
+        assert_eq!(default_workers(2), 2);
+        assert_eq!(default_workers(4), 2, "a Raspberry Pi 4");
+        assert_eq!(default_workers(6), 4);
+        assert_eq!(default_workers(10), 8);
+        assert_eq!(default_workers(64), 8);
     }
 }

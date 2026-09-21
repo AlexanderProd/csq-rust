@@ -1,15 +1,12 @@
 //! Encoding frames on a pool of threads while writing them in order.
 //!
-//! Frames are independent, so encoding parallelises perfectly — the only thing
-//! that has to be sequenced is the order they reach the sink in. Jobs go out on
-//! a bounded channel, which is what applies backpressure: a producer running
-//! ahead of the encoders blocks on submitting rather than growing a queue until
-//! memory runs out.
+//! Workers can encode frames independently, but completed frames must still be
+//! written in their original order. A bounded job queue limits memory use and
+//! pauses the producer when it gets too far ahead.
 //!
-//! The calling thread converts temperatures to counts and the workers do the
-//! entropy coding, which is the expensive part by an order of magnitude. Both
-//! the count buffers and the encoded frames are recycled, so a steady feed
-//! settles into a fixed set of allocations.
+//! The calling thread only copies each frame. Workers convert temperatures to
+//! detector counts and encode them. Pixel and output buffers are reused to
+//! avoid repeated allocations.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -18,63 +15,71 @@ use std::thread::JoinHandle;
 
 use crate::error::{Error, Result};
 use crate::metadata::{FrameMetadata, GpsInfo, Timestamp};
-use crate::thermal::{RadiometricParameters, RawConversion};
+use crate::thermal::RadiometricParameters;
 
 use super::frame::FrameEncoder;
 use super::{FramePixels, WriteFrame, WriteOptions};
 
-/// In-flight frames allowed per worker.
+/// Maximum queued or active frames per worker.
 ///
-/// Two is enough to keep a worker fed while the writer is busy with the sink,
-/// and small enough that the queue holds a fraction of a second of video.
+/// Two keeps workers busy without buffering too much video.
 const QUEUE_PER_WORKER: usize = 2;
 
-/// One frame handed to a worker.
+/// An owned copy of a frame's pixels.
+enum Pixels {
+    Raw(Vec<u16>),
+    Celsius(Vec<f32>),
+    Kelvin(Vec<f32>),
+}
+
+/// A frame waiting to be encoded by a worker.
 struct Job {
     sequence: u32,
-    counts: Vec<u16>,
+    pixels: Pixels,
     timestamp: Option<Timestamp>,
     gps: Option<GpsInfo>,
     radiometric: Option<RadiometricParameters>,
-    /// A recycled buffer for the worker to encode into.
+    /// Output buffer the worker can reuse.
     out: Vec<u8>,
 }
 
-/// One frame back from a worker.
+/// The result returned by a worker.
 struct Done {
     sequence: u32,
-    counts: Vec<u16>,
+    /// Pixel buffer returned for reuse.
+    pixels: Pixels,
     encoded: Result<Vec<u8>>,
 }
 
-/// A pool of encoder threads plus the reordering the sink needs.
+/// Encodes frames on worker threads and writes completed frames in order.
 pub(crate) struct Pipeline {
     width: usize,
     height: usize,
-    conversion: RawConversion,
-    /// Dropped to tell the workers to stop.
+    /// Dropping this sender tells workers that no more jobs are coming.
     jobs: Option<SyncSender<Job>>,
     done: Receiver<Done>,
     workers: Vec<JoinHandle<()>>,
-    /// Frames that finished before the ones ahead of them.
+    /// Completed frames waiting for earlier sequence numbers.
     held: HashMap<u32, Vec<u8>>,
-    /// Recycled buffers, handed back out with the next job.
+    /// Buffers available for reuse by future jobs.
     spare_counts: Vec<Vec<u16>>,
+    spare_temperatures: Vec<Vec<f32>>,
     spare_frames: Vec<Vec<u8>>,
-    /// The next sequence number the sink expects.
+    /// Sequence number of the next frame to write.
     next_to_write: u32,
-    /// Frames queued but not yet written.
+    /// Submitted frames that have not reached the sink.
     in_flight: usize,
 }
 
 impl Pipeline {
+    /// Starts an encoder pool using the supplied recording settings.
     pub(crate) fn start(
         metadata: &FrameMetadata,
         options: &WriteOptions,
         workers: usize,
     ) -> Result<Self> {
-        // Built once here so a bad configuration is reported to the caller
-        // rather than on a worker thread where nobody is listening.
+        // Validate the configuration before starting workers so errors are
+        // returned directly to the caller.
         let prototype = FrameEncoder::new(metadata, options)?;
         let (width, height) = prototype.dimensions();
 
@@ -96,8 +101,7 @@ impl Pipeline {
                     .name("csq-encoder".into())
                     .spawn(move || {
                         loop {
-                            // The lock is held only long enough to take a job,
-                            // never across encoding.
+                            // Release the shared queue lock before encoding.
                             let job = {
                                 let queue = job_queue.lock().unwrap_or_else(|e| e.into_inner());
                                 queue.recv()
@@ -115,7 +119,7 @@ impl Pipeline {
                             if finished
                                 .send(Done {
                                     sequence: job.sequence,
-                                    counts: std::mem::take(&mut job.counts),
+                                    pixels: job.pixels,
                                     encoded,
                                 })
                                 .is_err()
@@ -130,23 +134,24 @@ impl Pipeline {
         Ok(Self {
             width,
             height,
-            conversion: metadata.radiometric.raw_conversion(),
             jobs: Some(jobs),
             done,
             workers: handles,
             held: HashMap::new(),
             spare_counts: Vec::new(),
+            spare_temperatures: Vec::new(),
             spare_frames: Vec::new(),
             next_to_write: 0,
             in_flight: 0,
         })
     }
 
+    /// Returns the frame dimensions accepted by this pipeline.
     pub(crate) fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)
     }
 
-    /// Queues a frame, writing out whatever has become writable.
+    /// Queues a frame and writes any completed frames that are next in order.
     ///
     /// Returns how many bytes reached the sink during the call.
     pub(crate) fn submit(
@@ -155,40 +160,29 @@ impl Pipeline {
         sequence: u32,
         sink: &mut impl Write,
     ) -> Result<u64> {
-        // Converting here rather than on a worker keeps one buffer type in the
-        // queue and halves what crosses it; it is a twentieth of the cost of
-        // the entropy coding either way.
+        // Validate and copy here. Conversion and encoding stay on the worker.
         let expected = self.width * self.height;
-        let conversion = frame
-            .radiometric
-            .as_ref()
-            .map_or(self.conversion, RawConversion::new);
-        let mut counts = self.spare_counts.pop().unwrap_or_default();
-        match frame.pixels {
+        let pixels = match frame.pixels {
             FramePixels::Raw(raw) => {
                 check_len(raw.len(), expected)?;
+                let mut counts = self.spare_counts.pop().unwrap_or_default();
                 counts.clear();
                 counts.extend_from_slice(raw);
+                Pixels::Raw(counts)
             }
             FramePixels::Celsius(celsius) => {
                 check_len(celsius.len(), expected)?;
-                conversion.convert_into(celsius, &mut counts);
+                Pixels::Celsius(self.copy_temperatures(celsius))
             }
             FramePixels::Kelvin(kelvin) => {
                 check_len(kelvin.len(), expected)?;
-                counts.clear();
-                counts.reserve(kelvin.len());
-                counts.extend(
-                    kelvin
-                        .iter()
-                        .map(|&k| conversion.raw(k - crate::metadata::KELVIN_OFFSET)),
-                );
+                Pixels::Kelvin(self.copy_temperatures(kelvin))
             }
-        }
+        };
 
         let job = Job {
             sequence,
-            counts,
+            pixels,
             timestamp: frame.timestamp,
             gps: frame.gps.clone(),
             radiometric: frame.radiometric,
@@ -203,17 +197,26 @@ impl Pipeline {
         self.in_flight += 1;
 
         let mut written = self.collect(sink, Blocking::No)?;
-        // A queue that has filled up means the producer is ahead of the pool;
-        // waiting here rather than in the next send keeps the sink busy.
+        // If the pipeline is full, wait for completed work and keep the sink
+        // moving before accepting another frame.
         while self.in_flight >= self.workers.len() * QUEUE_PER_WORKER {
             written += self.collect(sink, Blocking::Yes)?;
         }
         Ok(written)
     }
 
-    /// Waits for every queued frame and writes it out.
+    /// Copies temperatures into an available buffer, allocating only when no
+    /// spare buffer exists.
+    fn copy_temperatures(&mut self, temperatures: &[f32]) -> Vec<f32> {
+        let mut copy = self.spare_temperatures.pop().unwrap_or_default();
+        copy.clear();
+        copy.extend_from_slice(temperatures);
+        copy
+    }
+
+    /// Stops accepting jobs, waits for all workers, and writes every frame.
     pub(crate) fn drain(&mut self, sink: &mut impl Write) -> Result<u64> {
-        // Dropping the sender is what tells the workers there is no more work.
+        // Closing the job channel lets each worker exit after its final job.
         self.jobs = None;
 
         let mut written = 0;
@@ -226,7 +229,7 @@ impl Pipeline {
         Ok(written)
     }
 
-    /// Takes finished frames and writes those the sink is ready for.
+    /// Collects worker results and writes the consecutive frames now available.
     fn collect(&mut self, sink: &mut impl Write, blocking: Blocking) -> Result<u64> {
         loop {
             let done = match blocking {
@@ -239,11 +242,15 @@ impl Pipeline {
             };
 
             self.in_flight -= 1;
-            self.spare_counts.push(done.counts);
+            match done.pixels {
+                Pixels::Raw(counts) => self.spare_counts.push(counts),
+                Pixels::Celsius(temperatures) | Pixels::Kelvin(temperatures) => {
+                    self.spare_temperatures.push(temperatures);
+                }
+            }
             self.held.insert(done.sequence, done.encoded?);
 
-            // One blocking wait is one frame; anything else already waiting is
-            // picked up by the loop below on the next pass.
+            // In blocking mode, wait for only one result per call.
             if matches!(blocking, Blocking::Yes) {
                 break;
             }
@@ -274,9 +281,13 @@ enum Blocking {
     No,
 }
 
-/// Rebuilds the borrowed frame a worker encodes from its owned job.
+/// Creates the borrowed `WriteFrame` view expected by `FrameEncoder`.
 fn build_frame(job: &Job) -> WriteFrame<'_> {
-    let mut frame = WriteFrame::raw(&job.counts);
+    let mut frame = match &job.pixels {
+        Pixels::Raw(counts) => WriteFrame::raw(counts),
+        Pixels::Celsius(celsius) => WriteFrame::celsius(celsius),
+        Pixels::Kelvin(kelvin) => WriteFrame::kelvin(kelvin),
+    };
     if let Some(timestamp) = job.timestamp {
         frame = frame.at(timestamp);
     }
@@ -284,8 +295,7 @@ fn build_frame(job: &Job) -> WriteFrame<'_> {
         frame = frame.with_gps(gps.clone());
     }
     if let Some(radiometric) = job.radiometric {
-        // The counts are already converted; this only records the parameters a
-        // reader needs to convert them back.
+        // Use these values for conversion and store them in the encoded frame.
         frame = frame.with_radiometric(radiometric);
     }
     frame
@@ -305,9 +315,8 @@ fn worker_gone() -> Error {
     }
 }
 
-/// Recycled buffers hold the frame currently in flight, so a spare list that
-/// grew without bound would be a leak; it cannot, because a buffer only goes
-/// back on it when a frame leaves the queue.
+/// Tests also ensure that owned job data is rebuilt as the correct borrowed
+/// frame type.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,7 +325,7 @@ mod tests {
     fn a_worker_frame_carries_the_jobs_details() {
         let job = Job {
             sequence: 7,
-            counts: vec![1, 2, 3, 4],
+            pixels: Pixels::Raw(vec![1, 2, 3, 4]),
             timestamp: Some(Timestamp {
                 unix_seconds: 42,
                 milliseconds: 5,
@@ -328,7 +337,22 @@ mod tests {
         };
 
         let frame = build_frame(&job);
-        assert!(matches!(frame.pixels(), FramePixels::Raw(counts) if counts == job.counts));
+        assert!(matches!(frame.pixels(), FramePixels::Raw(counts) if counts == [1, 2, 3, 4]));
         assert_eq!(frame.timestamp, job.timestamp);
+    }
+
+    #[test]
+    fn temperatures_reach_the_worker_unconverted() {
+        let job = Job {
+            sequence: 0,
+            pixels: Pixels::Kelvin(vec![293.15, 300.0]),
+            timestamp: None,
+            gps: None,
+            radiometric: None,
+            out: Vec::new(),
+        };
+
+        let frame = build_frame(&job);
+        assert!(matches!(frame.pixels(), FramePixels::Kelvin(kelvin) if kelvin == [293.15, 300.0]));
     }
 }
