@@ -398,6 +398,32 @@ impl FrameLayout {
             .ok_or(Error::MissingRecord(kind))?
             .data(frame)
     }
+
+    /// How far into the frame its header, directory and records reach.
+    ///
+    /// This is the frame's length as far as anything in it is concerned, and
+    /// what [`FrameIndex`](crate::FrameIndex) falls back on when a producer
+    /// left [`FrameHeader::length`] at zero.
+    pub fn extent(&self) -> u64 {
+        let directory_end = u64::from(self.header.index_offset)
+            + u64::from(self.header.record_count) * RECORD_ENTRY_LEN as u64;
+        self.records
+            .iter()
+            .filter(|record| record.length > 0)
+            .map(|record| u64::from(record.offset) + u64::from(record.length))
+            .fold(directory_end.max(HEADER_LEN as u64), u64::max)
+    }
+}
+
+/// Works out a frame's length from its record directory.
+///
+/// For frames whose header leaves the length at zero — `ResearchIR` writes them
+/// that way, and so do many cameras inside radiometric JPEGs. Returns `None`
+/// when `frame` does not start with a parsable header and directory.
+pub fn frame_extent(frame: &[u8]) -> Option<u64> {
+    FrameLayout::parse(frame, 0)
+        .ok()
+        .map(|layout| layout.extent())
 }
 
 /// Reads a NUL-terminated, NUL-padded string out of a fixed-size field.

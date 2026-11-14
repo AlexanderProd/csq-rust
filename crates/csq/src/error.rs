@@ -40,6 +40,12 @@ pub enum Error {
     /// A record the caller needs is not present in the frame.
     MissingRecord(RecordType),
 
+    /// A JPEG carries no usable FLIR radiometric data.
+    NotRadiometricJpeg {
+        /// Human-readable description of what was found instead.
+        detail: String,
+    },
+
     /// The JPEG-LS payload could not be decoded.
     JpegLs(JpegLsError),
 
@@ -107,6 +113,9 @@ impl fmt::Display for Error {
                 "frame at byte offset {offset} declares an invalid length of {length}"
             ),
             Self::MissingRecord(kind) => write!(f, "frame has no {kind} record"),
+            Self::NotRadiometricJpeg { detail } => {
+                write!(f, "not a FLIR radiometric JPEG: {detail}")
+            }
             Self::JpegLs(e) => write!(f, "raw thermal image: {e}"),
             Self::UnsupportedRawImage { detail } => {
                 write!(f, "unsupported raw thermal image encoding: {detail}")

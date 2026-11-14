@@ -77,8 +77,17 @@ impl FrameIndex {
             }
 
             // The length is read through the container's own byte order, which
-            // some camera models write big-endian.
-            let length = fff::frame_length(&data[offset..]).unwrap_or(0) as usize;
+            // some camera models write big-endian. Producers that leave it at
+            // zero still describe every record they wrote, so the directory
+            // says where the frame ends. Scanning for the next signature is no
+            // substitute: uncompressed pixel data contains `FFF\0` often enough.
+            let length = match fff::frame_length(&data[offset..]) {
+                Some(0) => fff::frame_extent(&data[offset..])
+                    .and_then(|extent| usize::try_from(extent).ok())
+                    .unwrap_or(0),
+                Some(length) => length as usize,
+                None => 0,
+            };
             let end = offset.checked_add(length);
             let body_fits = length >= HEADER_LEN && end.is_some_and(|end| end <= data.len());
 
@@ -97,8 +106,10 @@ impl FrameIndex {
 
                 // The frame itself is intact but something sits between it and
                 // the next one — cameras that pad frames to a fixed slot size do
-                // this. Keep the declared length and skip the filler.
-                match find_magic(data, offset) {
+                // this. Keep the declared length and skip the filler. The search
+                // starts at the frame's end, so a signature that happens to
+                // occur inside its pixel data is not mistaken for the next frame.
+                match find_magic(data, end - 1) {
                     Some(next) => {
                         padded_frames += 1;
                         offset = next;
@@ -297,6 +308,46 @@ mod tests {
             0,
             "big-endian lengths should be followed, not scanned past"
         );
+    }
+
+    #[test]
+    fn sizes_zero_length_frames_from_their_records() {
+        // ResearchIR leaves the length at zero. One record runs to byte 200,
+        // and its body happens to contain the signature, as uncompressed pixel
+        // data occasionally does; that must not be taken for the next frame.
+        let mut first = frame(200);
+        first[0x34..0x38].copy_from_slice(&0u32.to_le_bytes());
+        let entry = HEADER_LEN;
+        first[entry..entry + 2].copy_from_slice(&1u16.to_le_bytes());
+        first[entry + 12..entry + 16].copy_from_slice(&96u32.to_le_bytes());
+        first[entry + 16..entry + 20].copy_from_slice(&104u32.to_le_bytes());
+        first[150..154].copy_from_slice(&MAGIC);
+
+        let mut data = first;
+        data.extend(frame(100));
+
+        let index = FrameIndex::build(&data);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(0).unwrap().length, 200);
+        assert_eq!(index.get(1).unwrap().offset, 200);
+        assert_eq!(index.resynchronisations(), 0);
+        assert_eq!(index.padded_frames(), 0);
+    }
+
+    #[test]
+    fn padding_search_starts_after_the_frame() {
+        // A signature inside a frame's own body must not be mistaken for the
+        // start of the next one when padding follows the frame.
+        let mut first = frame(100);
+        first[70..74].copy_from_slice(&MAGIC);
+        let mut data = first;
+        data.extend(std::iter::repeat_n(0u8, 20));
+        data.extend(frame(100));
+
+        let index = FrameIndex::build(&data);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.get(1).unwrap().offset, 120);
+        assert_eq!(index.padded_frames(), 1);
     }
 
     #[test]
