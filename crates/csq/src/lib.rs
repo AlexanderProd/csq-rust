@@ -11,6 +11,21 @@
 //! frame header states its own length, which is enough to index a recording by
 //! reading 64 bytes per frame.
 //!
+//! # Other FLIR formats
+//!
+//! The same FFF frames turn up elsewhere, and [`CsqFile::open`] reads them all:
+//!
+//! | Format | What it is |
+//! |--------|------------|
+//! | `.csq` | FFF frames back to back, JPEG-LS compressed |
+//! | `.seq` | FFF frames back to back, usually uncompressed |
+//! | `.fff` | a single FFF frame |
+//! | `.jpg` | a radiometric still: one FFF frame split across JPEG APP1 segments, see [`flir_jpeg`] |
+//!
+//! A radiometric JPEG opens as a one-frame recording. Files written by
+//! `ResearchIR` leave each frame's length at zero; the record directory still
+//! says where a frame ends, and that is what is used.
+//!
 //! # Reading a recording
 //!
 //! [`CsqFile`] indexes a file on open and decodes any frame on demand:
@@ -136,6 +151,7 @@
 #![warn(clippy::doc_markdown)]
 
 pub mod fff;
+pub mod flir_jpeg;
 pub mod jpegls;
 pub mod metadata;
 pub mod render;

@@ -222,11 +222,14 @@ impl FrameDecoder {
 
         self.pixels.clear();
         match bit_depth {
-            // PNG stores 16-bit samples big-endian.
+            // The PNG specification says 16-bit samples are big-endian, but
+            // FLIR writes them little-endian. Read the other way round, a
+            // smooth thermal image turns into noise spanning 0..65535 — checked
+            // against stills from the E4, E5, i5, C5, AX8 and ONE series.
             png::BitDepth::Sixteen => self.pixels.extend(
                 bytes
                     .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]])),
+                    .map(|c| u16::from_le_bytes([c[0], c[1]])),
             ),
             png::BitDepth::Eight => self.pixels.extend(bytes.iter().map(|&b| u16::from(b))),
             depth => {

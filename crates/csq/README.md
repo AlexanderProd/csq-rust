@@ -7,6 +7,13 @@ No `exiftool` subprocess, no C++ toolchain, no system libraries — the FFF
 (FLIR File Format) container parser, the JPEG-LS codec and the radiometric
 model are all in this crate. The only mandatory dependency is `memmap2`.
 
+Besides `.csq` recordings, `CsqFile::open` reads the other places FLIR puts
+FFF frames: `.seq` recordings, single `.fff` frames, and radiometric `.jpg`
+stills, which open as one-frame recordings. Stills from over 25 camera models
+have been checked against an independent reference implementation — E4 to E75,
+C5, i5, T630sc, SC660, the FLIR ONE series, Vue Pro, ThermaCAM B400 and the DJI
+Zenmuse XT, XT2 and XT-R.
+
 ```toml
 [dependencies]
 csq = "0.3"

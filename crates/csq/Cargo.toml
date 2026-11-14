@@ -1,6 +1,6 @@
 [package]
 name = "csq"
-description = "Read and write FLIR CSQ/FFF thermal video: per-pixel temperatures, frame indexing, seeking, rendering and recording — in pure Rust."
+description = "Read and write FLIR thermal data — CSQ and SEQ recordings, FFF frames and radiometric JPEGs: per-pixel temperatures, frame indexing, seeking, rendering and recording — in pure Rust."
 version = "0.3.0"
 authors.workspace = true
 edition.workspace = true

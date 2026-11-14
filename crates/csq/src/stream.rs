@@ -149,7 +149,13 @@ impl<R: Read> CsqStream<R> {
 
         // Read through the container's own byte order; some cameras write the
         // header big-endian.
-        let length = fff::frame_length(&self.buffer).unwrap_or(0) as usize;
+        let length = match fff::frame_length(&self.buffer) {
+            // ResearchIR leaves the length at zero; the record directory still
+            // says how far the frame reaches.
+            Some(0) => self.read_extent_from_directory()?,
+            Some(length) => length as usize,
+            None => 0,
+        };
 
         if length < HEADER_LEN {
             return Err(Error::InvalidFrameLength {
@@ -158,19 +164,48 @@ impl<R: Read> CsqStream<R> {
             });
         }
 
-        self.buffer.resize(length, 0);
-        match read_exact_or_eof(&mut self.source, &mut self.buffer[HEADER_LEN..])? {
-            Filled::Full => {}
-            _ => {
-                return Err(Error::Truncated {
-                    what: "FFF frame",
-                    offset: self.offset,
-                })
-            }
-        }
-
+        self.fill_to(length, "FFF frame")?;
         self.offset += length as u64;
         Ok(Some(()))
+    }
+
+    /// For a frame whose header gives no length: reads up to the end of its
+    /// record directory and returns how long the records say the frame is.
+    fn read_extent_from_directory(&mut self) -> Result<usize> {
+        let header = fff::FrameHeader::parse(&self.buffer, self.offset)?;
+        let directory_end = u64::from(header.index_offset)
+            + u64::from(header.record_count) * fff::RECORD_ENTRY_LEN as u64;
+        let directory_end = usize::try_from(directory_end).map_err(|_| Error::Truncated {
+            what: "record directory",
+            offset: self.offset,
+        })?;
+        self.fill_to(directory_end, "record directory")?;
+
+        let extent = fff::frame_extent(&self.buffer).ok_or(Error::Truncated {
+            what: "record directory",
+            offset: self.offset,
+        })?;
+        usize::try_from(extent).map_err(|_| Error::InvalidFrameLength {
+            offset: self.offset,
+            length: 0,
+        })
+    }
+
+    /// Grows `self.buffer` to `len` bytes, reading the new part from the
+    /// source. Shrinking is never needed and is ignored.
+    fn fill_to(&mut self, len: usize, what: &'static str) -> Result<()> {
+        let have = self.buffer.len();
+        if len <= have {
+            return Ok(());
+        }
+        self.buffer.resize(len, 0);
+        match read_exact_or_eof(&mut self.source, &mut self.buffer[have..])? {
+            Filled::Full => Ok(()),
+            _ => Err(Error::Truncated {
+                what,
+                offset: self.offset,
+            }),
+        }
     }
 
     /// Consumes the stream and yields the wrapped source.

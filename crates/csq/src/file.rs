@@ -85,6 +85,13 @@ impl CsqFile {
     }
 
     fn from_storage(storage: Storage) -> Result<Self> {
+        // A radiometric JPEG is one FFF frame split across APP1 segments. Once
+        // reassembled it is indistinguishable from a one-frame recording.
+        let storage = if crate::flir_jpeg::is_jpeg(&storage) {
+            Storage::Owned(crate::flir_jpeg::extract_fff(&storage)?)
+        } else {
+            storage
+        };
         let index = FrameIndex::build(&storage);
 
         // Parse the first frame's metadata once so frame rate, geometry and
